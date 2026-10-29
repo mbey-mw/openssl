@@ -1922,9 +1922,47 @@ int tls_write_records(OSSL_RECORD_LAYER *rl, OSSL_RECORD_TEMPLATE *templates,
     return tls_retry_write_records(rl);
 }
 
+#ifndef OPENSSL_NO_DTLS1_3_MINUNIHDR
+/*
+ * A unified header with no length field makes the datagram boundary the only
+ * record boundary, so a record must reach the transport on its own. The
+ * handshake state machine pushes a BIO_f_buffer in front of the write BIO, and
+ * both BIO_write() and BIO_sendmmsg() merely append to that buffer, so it has
+ * to be drained once per record. Connections that can never use a unified
+ * header keep packing several records into one datagram.
+ *
+ * Returns 1 when the write BIO is drained, 0 when the data could not go out
+ * yet and -1 on a fatal error.
+ */
+static int tls_drain_write_bio(OSSL_RECORD_LAYER *rl)
+{
+    if (!rl->isdtls
+        || (rl->version != DTLS1_3_VERSION
+            && rl->version != DTLS_ANY_VERSION))
+        return 1;
+
+    ERR_set_mark();
+    if (BIO_flush(rl->bio) > 0) {
+        ERR_clear_last_mark();
+        return 1;
+    }
+    if (BIO_should_retry(rl->bio)) {
+        ERR_pop_to_mark();
+        return 0;
+    }
+    ERR_clear_last_mark();
+    ERR_raise_data(ERR_LIB_SYS, get_last_sys_error(),
+        "tls_drain_write_bio BIO_flush failure");
+    return -1;
+}
+#endif /* OPENSSL_NO_DTLS1_3_MINUNIHDR */
+
 int tls_retry_write_records(OSSL_RECORD_LAYER *rl)
 {
     int i, ret;
+#ifndef OPENSSL_NO_DTLS1_3_MINUNIHDR
+    int drained;
+#endif
     TLS_BUFFER *thiswb;
     size_t tmpwrit = 0, left;
 
@@ -1942,6 +1980,22 @@ int tls_retry_write_records(OSSL_RECORD_LAYER *rl)
                 if (ret != OSSL_RECORD_RETURN_SUCCESS)
                     return ret;
             }
+
+#ifndef OPENSSL_NO_DTLS1_3_MINUNIHDR
+            /*
+             * A record left in the buffer by a failed drain below must go out
+             * before this record is appended to it, or the two would share one
+             * datagram. Nothing of this record has been handed over yet, so
+             * backing off here loses nothing.
+             */
+            if (BIO_ctrl_wpending(rl->bio) > 0) {
+                drained = tls_drain_write_bio(rl);
+                if (drained == 0)
+                    return OSSL_RECORD_RETURN_RETRY;
+                if (drained < 0)
+                    return OSSL_RECORD_RETURN_FATAL;
+            }
+#endif /* OPENSSL_NO_DTLS1_3_MINUNIHDR */
 
 #ifndef OPENSSL_NO_SOCK
             /*
@@ -2046,6 +2100,28 @@ int tls_retry_write_records(OSSL_RECORD_LAYER *rl)
          * writes to permit this case.
          */
         if (i >= 0 && tmpwrit == left) {
+#ifndef OPENSSL_NO_DTLS1_3_MINUNIHDR
+            /*
+             * Epoch 0 records are drained too: they carry a length field
+             * themselves, but a length-less record appended behind them in the
+             * same datagram would leave the peer no way to find the boundary.
+             */
+            drained = tls_drain_write_bio(rl);
+            if (drained <= 0) {
+                /*
+                 * The record already sits inside the buffering BIO, so it must
+                 * not be handed over a second time. Consume it here and let the
+                 * drain above push it out ahead of the next record - the peer
+                 * just sees the datagram late, which DTLS tolerates.
+                 */
+                TLS_BUFFER_set_left(thiswb, 0);
+                if (++(rl->nextwbuf) == rl->numwpipes
+                    && (rl->mode & SSL_MODE_RELEASE_BUFFERS) != 0)
+                    tls_release_write_buffer(rl);
+                return drained == 0 ? OSSL_RECORD_RETURN_RETRY
+                    : OSSL_RECORD_RETURN_FATAL;
+            }
+#endif /* OPENSSL_NO_DTLS1_3_MINUNIHDR */
             TLS_BUFFER_set_left(thiswb, 0);
             TLS_BUFFER_add_offset(thiswb, tmpwrit);
             if (++(rl->nextwbuf) < rl->numwpipes)

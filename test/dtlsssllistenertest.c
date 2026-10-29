@@ -4141,12 +4141,23 @@ static int test_dtls13_listener_msg_buffering(void)
             max_records_in_datagram = record_count;
     }
 
+#ifdef OPENSSL_NO_DTLS1_3_MINUNIHDR
     /*
      * The key assertion: with buffering enabled, at least one datagram should
      * contain multiple records.
      */
     if (!TEST_int_gt(max_records_in_datagram, 1))
         goto end;
+
+#else
+    /*
+     * The key assertion: with buffering enabled, still no datagram should
+     * contain multiple records, as defined for the missing length field.
+     */
+    if (!TEST_int_eq(max_records_in_datagram, 1))
+        goto end;
+
+#endif /* OPENSSL_NO_DTLS1_3_MINUNIHDR */
 
     testresult = 1;
 end:

@@ -2590,6 +2590,226 @@ end:
     SSL_CTX_free(sctx);
     return testresult;
 }
+/*
+ * State of the datagram filter below.
+ */
+typedef struct {
+    int reject_next;    /* an encrypted datagram is still to be rejected */
+    int rejected;       /* datagrams rejected so far */
+    int malformed;      /* a datagram did not hold whole records */
+    int max_records;    /* most records ever seen in one datagram */
+} flush_retry_data;
+
+/*
+ * Count the DTLS records packed into one datagram. A unified header with no
+ * length field stretches to the end of the datagram, so only a record which
+ * does carry a length can show that another one follows it. Returns -1 if the
+ * datagram does not consist of whole records.
+ */
+static int count_datagram_records(const unsigned char *p, int len)
+{
+    int records = 0;
+
+    while (len > 0) {
+        int hdrlen, reclen;
+
+        if (DTLS13_UNI_HDR_FIX_BITS_IS_SET(*p)) {
+            hdrlen = 1 + (DTLS13_UNI_HDR_SEQ_BIT_IS_SET(*p) ? 2 : 1);
+            if (len < hdrlen)
+                return -1;
+            if (DTLS13_UNI_HDR_LEN_BIT_IS_SET(*p)) {
+                reclen = (p[hdrlen] << 8) | p[hdrlen + 1];
+                hdrlen += 2;
+            } else {
+                reclen = len - hdrlen;
+            }
+        } else {
+            if (len < DTLS1_RT_HEADER_LENGTH)
+                return -1;
+            hdrlen = DTLS1_RT_HEADER_LENGTH;
+            reclen = (p[DTLS1_RT_HEADER_LENGTH - 2] << 8)
+                | p[DTLS1_RT_HEADER_LENGTH - 1];
+        }
+        reclen += hdrlen;
+        if (len < reclen)
+            return -1;
+        records++;
+        p += reclen;
+        len -= reclen;
+    }
+    return records;
+}
+
+static int flush_retry_write_ex(BIO *bio, const char *buf, size_t buf_len,
+    size_t *written)
+{
+    flush_retry_data *f = BIO_get_data(bio);
+    BIO *next = BIO_next(bio);
+    int records;
+
+    if (f == NULL || next == NULL)
+        return 0;
+
+    if (f->reject_next && buf_len > 0
+        && DTLS13_UNI_HDR_FIX_BITS_IS_SET((unsigned char)buf[0])) {
+        /*
+         * Pretend the transport buffer is full. The record stays inside the
+         * buffering BIO the handshake state machine installed, and the record
+         * layer has to back off with it still pending.
+         */
+        f->reject_next = 0;
+        f->rejected++;
+        BIO_set_retry_write(bio);
+        return 0;
+    }
+
+    records = count_datagram_records((const unsigned char *)buf, (int)buf_len);
+    if (records < 0) {
+        f->malformed = 1;
+    } else if (records > f->max_records) {
+        f->max_records = records;
+    }
+
+    if (!BIO_write_ex(next, buf, buf_len, written)) {
+        BIO_copy_next_retry(bio);
+        return 0;
+    }
+    return 1;
+}
+
+static long flush_retry_ctrl(BIO *bio, int cmd, long num, void *ptr)
+{
+    BIO *next = BIO_next(bio);
+
+    if (next == NULL || cmd == BIO_CTRL_DUP)
+        return 0;
+    return BIO_ctrl(next, cmd, num, ptr);
+}
+
+/*
+ * The peer reads through the same chain, so reads have to reach the packet
+ * store underneath untouched.
+ */
+static int flush_retry_read_ex(BIO *bio, char *buf, size_t buf_len,
+    size_t *readbytes)
+{
+    BIO *next = BIO_next(bio);
+
+    if (next == NULL)
+        return 0;
+    if (!BIO_read_ex(next, buf, buf_len, readbytes)) {
+        BIO_copy_next_retry(bio);
+        return 0;
+    }
+    return 1;
+}
+
+static int flush_retry_create(BIO *bio)
+{
+    flush_retry_data *f = OPENSSL_zalloc(sizeof(*f));
+
+    if (f == NULL)
+        return 0;
+    BIO_set_data(bio, f);
+    BIO_set_init(bio, 1);
+    return 1;
+}
+
+static int flush_retry_destroy(BIO *bio)
+{
+    OPENSSL_free(BIO_get_data(bio));
+    BIO_set_data(bio, NULL);
+    BIO_set_init(bio, 0);
+    return 1;
+}
+
+/* Choose a sufficiently large type likely to be unused for this custom BIO */
+#define BIO_TYPE_FLUSH_RETRY_FILTER (0x84 | BIO_TYPE_FILTER)
+
+/* Note: Not thread safe! */
+static const BIO_METHOD *bio_f_flush_retry_filter(void)
+{
+    static BIO_METHOD *m = NULL;
+
+    if (m == NULL) {
+        m = BIO_meth_new(BIO_TYPE_FLUSH_RETRY_FILTER, "Failing flush filter");
+        if (m == NULL
+            || !BIO_meth_set_write_ex(m, flush_retry_write_ex)
+            || !BIO_meth_set_read_ex(m, flush_retry_read_ex)
+            || !BIO_meth_set_ctrl(m, flush_retry_ctrl)
+            || !BIO_meth_set_create(m, flush_retry_create)
+            || !BIO_meth_set_destroy(m, flush_retry_destroy))
+            return NULL;
+    }
+    return m;
+}
+
+/*
+ * A DTLS record which could not be flushed out of the buffering BIO that the
+ * handshake state machine puts in front of the write BIO must not be followed
+ * into the same datagram by the record written after it. With a unified header
+ * that carries no length field the peer has no way of finding the boundary
+ * between the two, so the record layer has to drain the buffer on its own
+ * before anything else is appended to it.
+ *
+ * The filter rejects the first encrypted datagram the server hands over, which
+ * leaves that record sitting in the buffer. The handshake still has to
+ * complete, and every datagram which does go out has to hold one record.
+ */
+static int test_dtls13_flush_retry(void)
+{
+    SSL_CTX *sctx = NULL, *cctx = NULL;
+    SSL *serverssl = NULL, *clientssl = NULL;
+    BIO *filter = NULL;
+    flush_retry_data *f;
+    int created;
+    int testresult = 0;
+
+    if (!TEST_true(create_ssl_ctx_pair(NULL, DTLS_server_method(),
+            DTLS_client_method(), DTLS1_3_VERSION, DTLS1_3_VERSION,
+            &sctx, &cctx, cert, privkey)))
+        return 0;
+
+    if (!TEST_ptr(filter = BIO_new(bio_f_flush_retry_filter())))
+        goto end;
+    f = BIO_get_data(filter);
+    if (!TEST_ptr(f))
+        goto end;
+    f->reject_next = 1;
+
+    /*
+     * The filter goes on the server to client side, so it sees the datagrams
+     * the server sends. create_ssl_objects() takes ownership of it either way,
+     * but f stays valid while the SSL objects live.
+     */
+    created = create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+        filter, NULL);
+    filter = NULL;
+    if (!TEST_true(created))
+        goto end;
+
+    if (!TEST_true(create_ssl_connection(serverssl, clientssl,
+            SSL_ERROR_NONE)))
+        goto end;
+
+    /* The test is worthless unless the failure really was injected. */
+    if (!TEST_int_eq(f->rejected, 1))
+        goto end;
+    if (!TEST_int_eq(f->malformed, 0))
+        goto end;
+    if (!TEST_int_eq(f->max_records, 1))
+        goto end;
+
+    testresult = 1;
+end:
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    BIO_free(filter);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+
+    return testresult;
+}
 #endif /* OPENSSL_NO_DTLS1_3 */
 
 OPT_TEST_DECLARE_USAGE("certfile privkeyfile\n")
@@ -2640,6 +2860,7 @@ int setup_tests(void)
     ADD_ALL_TESTS(test_dtls13_plaintext_after_hellos, 3);
     ADD_TEST(test_dtls13_ccm8_not_offered);
     ADD_TEST(test_dtls13_ack_read_timeout);
+    ADD_TEST(test_dtls13_flush_retry);
 #endif
 #ifndef OPENSSL_NO_DTLS1_2
     ADD_TEST(test_dtls_client_retransmit);
