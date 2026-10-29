@@ -1099,8 +1099,8 @@ int dtls_prepare_record_header(OSSL_RECORD_LAYER *rl,
         maxcomplen += SSL3_RT_MAX_COMPRESSED_OVERHEAD;
 
     if (unifiedheader) {
-        uint8_t fixedbits = 0x20;
-        uint8_t cbit = 0;
+        uint8_t fixedbits = DTLS13_UNI_HDR_FIX_BITS;
+        uint8_t cbit = 0; // DTLS13_UNI_HDR_CID_BIT;
         uint8_t sbit = DTLS13_UNI_HDR_SEQ_BIT;
         uint8_t lbit = DTLS13_UNI_HDR_LEN_BIT;
         uint8_t ebits = rl->epoch & DTLS13_UNI_HDR_EPOCH_BITS_MASK;
@@ -1113,7 +1113,8 @@ int dtls_prepare_record_header(OSSL_RECORD_LAYER *rl,
         if (!WPACKET_put_bytes_u8(thispkt, unifiedhdrbits)
             || (sbit ? !WPACKET_put_bytes_u16(thispkt, seqnum)
                      : !WPACKET_put_bytes_u8(thispkt, seqnum))
-            || !WPACKET_start_sub_packet_u16(thispkt)
+            || (lbit ? !WPACKET_start_sub_packet_u16(thispkt)
+                     : !WPACKET_start_sub_packet(thispkt))
             || (rl->eivlen > 0
                 && !WPACKET_allocate_bytes(thispkt, rl->eivlen, NULL))
             || (maxcomplen > 0

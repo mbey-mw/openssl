@@ -389,11 +389,12 @@ static uint8_t tls13_get_record_type(OSSL_RECORD_LAYER *rl,
      */
     if (rl->isdtls) {
         const unsigned char fixed = DTLS13_UNI_HDR_FIX_BITS;
+        const unsigned char cbit = 0; // DTLS13_UNI_HDR_CID_BIT;
         const unsigned char sbit = DTLS13_UNI_HDR_SEQ_BIT;
         const unsigned char lbit = DTLS13_UNI_HDR_LEN_BIT;
         const unsigned char epochbits = DTLS13_UNI_HDR_EPOCH_BITS_MASK & rl->epoch;
 
-        return fixed | sbit | lbit | epochbits;
+        return fixed | cbit | sbit | lbit | epochbits;
     }
 
     return SSL3_RT_APPLICATION_DATA;
