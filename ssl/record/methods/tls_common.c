@@ -1961,6 +1961,9 @@ int tls_retry_write_records(OSSL_RECORD_LAYER *rl)
                 ERR_set_mark();
                 if (BIO_sendmmsg(rl->bio, &msg, sizeof(msg), 1, 0, &processed)
                     && processed == 1) {
+#ifndef OPENSSL_NO_DTLS1_3_MINUNIHDR
+                    BIO_flush(rl->bio); // flush after each record, because we do not have a length field
+#endif /* OPENSSL_NO_DTLS1_3_MINUNIHDR */
                     ERR_clear_last_mark();
                     tmpwrit = msg.data_len;
                     ret = OSSL_RECORD_RETURN_SUCCESS;
