@@ -1101,8 +1101,13 @@ int dtls_prepare_record_header(OSSL_RECORD_LAYER *rl,
     if (unifiedheader) {
         uint8_t fixedbits = DTLS13_UNI_HDR_FIX_BITS;
         uint8_t cbit = 0; // DTLS13_UNI_HDR_CID_BIT;
+#ifdef OPENSSL_NO_DTLS1_3_MINUNIHDR
         uint8_t sbit = DTLS13_UNI_HDR_SEQ_BIT;
         uint8_t lbit = DTLS13_UNI_HDR_LEN_BIT;
+#else
+        uint8_t sbit = 0;
+        uint8_t lbit = 0;
+#endif /* OPENSSL_NO_DTLS1_3_MINUNIHDR */
         uint8_t ebits = rl->epoch & DTLS13_UNI_HDR_EPOCH_BITS_MASK;
         uint8_t unifiedhdrbits = fixedbits | cbit | sbit | lbit | ebits;
         uint64_t seqnum;
