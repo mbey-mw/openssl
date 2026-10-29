@@ -617,7 +617,7 @@ again:
                  * lower level transport
                  */
                 || (lbitisset ? !PACKET_get_net_2(&dtlsrecord, &length)
-                              : (length = (unsigned int)TLS_BUFFER_get_len(&rl->rbuf)) > 0)) {
+                              : (length = nread + TLS_BUFFER_get_left(&rl->rbuf) - 1 - recseqnumlen) == 0)) {
                 rr->length = 0;
                 rl->packet_length = 0;
                 goto again;
