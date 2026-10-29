@@ -1112,6 +1112,8 @@ typedef struct seqnum_test_st {
     int num;
 } SEQNUM_TEST;
 
+#ifdef OPENSSL_NO_DTLS1_3_MINUNIHDR
+
 static const SEQNUM_TEST seqnum_tests[] = {
     { 0x100, 1, 2 }, /* ordinary forward progression */
     { 0xfffe, 0, 2 }, /* end of the first period, reader at the epoch start */
@@ -1120,6 +1122,19 @@ static const SEQNUM_TEST seqnum_tests[] = {
     { 0x1ffff, 1, 4 }, /* ... and wraps again */
     { 0xfffffffe, 1, 4 }, /* ... and past the 32 bit boundary */
 };
+
+#else
+
+static const SEQNUM_TEST seqnum_tests[] = {
+    { 0x20, 1, 2 }, /* ordinary forward progression */
+    { 0xfe, 0, 2 }, /* end of the first period, reader at the epoch start */
+    { 200, 0, 2 }, /* more than half a period past the reader's window */
+    { 0xff, 1, 4 }, /* the 8 bit sequence number field wraps */
+    { 0x1ff, 1, 4 }, /* ... and wraps again */
+    { 0xfffffffe, 1, 4 }, /* ... and past the 32 bit boundary */
+};
+
+#endif /* OPENSSL_NO_DTLS1_3_MINUNIHDR */
 
 static int test_seq_num_wrap(int idx)
 {
