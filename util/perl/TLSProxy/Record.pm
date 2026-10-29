@@ -39,6 +39,18 @@ my %record_type = (
     RT_CCS, "CCS",
     RT_ACK, "ACK",
     RT_UNKNOWN, "UNKNOWN",
+    0x20, "DTLS UNIFIED HEADER (EPOCH 4)",
+    0x21, "DTLS UNIFIED HEADER (EPOCH 1)",
+    0x22, "DTLS UNIFIED HEADER (EPOCH 2)",
+    0x23, "DTLS UNIFIED HEADER (EPOCH 3)",
+    0x24, "DTLS UNIFIED HEADER (EPOCH 4)",
+    0x25, "DTLS UNIFIED HEADER (EPOCH 1)",
+    0x26, "DTLS UNIFIED HEADER (EPOCH 2)",
+    0x27, "DTLS UNIFIED HEADER (EPOCH 3)",
+    0x28, "DTLS UNIFIED HEADER (EPOCH 4)",
+    0x29, "DTLS UNIFIED HEADER (EPOCH 1)",
+    0x21, "DTLS UNIFIED HEADER (EPOCH 2)",
+    0x2b, "DTLS UNIFIED HEADER (EPOCH 3)",
     RT_DTLS_UNIHDR_EPOCH4, "DTLS UNIFIED HEADER (EPOCH 4)",
     RT_DTLS_UNIHDR_EPOCH1, "DTLS UNIFIED HEADER (EPOCH 1)",
     RT_DTLS_UNIHDR_EPOCH2, "DTLS UNIFIED HEADER (EPOCH 2)",
@@ -92,9 +104,9 @@ sub get_records
         my $len;
         my $epoch;
         my $seq;
+        my $isunifiedhdr;
 
         if ($isdtls == 1) {
-            my $isunifiedhdr;
 
             $content_type = unpack('B[8]', $packet);
             $isunifiedhdr = substr($content_type, 0, 3) == "001";
@@ -105,17 +117,28 @@ sub get_records
                 my $lbit = substr($content_type, 5, 1);
                 my $eebits = substr($content_type, 6, 2);
 
-                if ($cbit == "1" || $lbit == "0") {
-                    die("TLSProxy does not support variable DTLSv1.3 unified header bits");
+                if ($cbit == "1") {
+                    die("TLSProxy does not support set Connection ID in DTLSv1.3 unified header bits");
                 }
 
                 # This is a unified header
-                if ($sbit == "1") {
-                    ($content_type, $seq, $len) = unpack('Cnn', $packet);
-                    $record_hdr_len = 5;
+                if ($lbit == "1") {
+                    if ($sbit == "1") {
+                        ($content_type, $seq, $len) = unpack('Cnn', $packet);
+                        $record_hdr_len = 5;
+                    } else {
+                        ($content_type, $seq, $len) = unpack('CCn', $packet);
+                        $record_hdr_len = 4;
+                    }
                 } else {
-                    ($content_type, $seq, $len) = unpack('CCn', $packet);
-                    $record_hdr_len = 4;
+                    if ($sbit == "1") {
+                        ($content_type, $seq) = unpack('Cn', $packet);
+                        $record_hdr_len = 3;
+                    } else {
+                        ($content_type, $seq) = unpack('CC', $packet);
+                        $record_hdr_len = 2;
+                    }
+                    $len = length($packet) - $record_hdr_len;
                 }
                 # Encrypted DTLS 1.3 records have encrypted sequence numbers.
                 # ossltest engine overrides ecb encryption to be a no-op.
@@ -136,7 +159,12 @@ sub get_records
                 } else {
                     die("Epoch bits is not 0's or 1's: should not happen")
                 }
-                $seq ^= $maskhi;
+
+                if ($sbit == "1") {
+                    $seq ^= $maskhi;
+                } else {
+                    $seq ^= $maskhi >> 8;
+                }
             } else {
                 my $seqhi;
                 my $seqmi;
@@ -200,9 +228,10 @@ sub get_records
 
         if ($content_type != RT_CCS
                 && (!TLSProxy::Proxy->is_tls13()
-                    || $content_type != RT_ALERT)) {
+                    || !$isdtls && $content_type != RT_ALERT
+                    || $isunifiedhdr)) {
             if (($serverissender && $server_encrypting)
-                     || (!$serverissender && $client_encrypting)) {
+                     || (!$serverissender && $client_encrypting) || TLSProxy::Proxy->is_tls13() && $isunifiedhdr) {
                 if (!TLSProxy::Proxy->is_tls13() && $etm) {
                     $record->decryptETM();
                 } else {
@@ -459,9 +488,32 @@ sub reconstruct_record
             # Mask sequence number with record body bytes. Explanation
             # given in get_records.
             (my $maskhi, my $maskmi, my $masklo) = unpack("nnn", $self->data);
-            $seqlo ^= $maskhi;
-            # Prepare a unified header
-            $data = pack('Cnn', $content_type, $seqlo, $self->len);
+
+            my $ct = unpack('B[8]', pack('C', $content_type));
+            my $sbit = substr($ct, 4, 1);
+            my $lbit = substr($ct, 5, 1);
+
+            if ($lbit == "1") {
+                if ($sbit == "1") {
+                    $seqlo ^= $maskhi;
+                    # Prepare a unified header
+                    $data = pack('Cnn', $content_type, $seqlo, $self->len);
+                } else {
+                    $seqlo = ($seqlo & 0xff) ^ ($maskhi >> 8);
+                    # Prepare a unified header
+                    $data = pack('CCn', $content_type, $seqlo, $self->len);
+                }
+            } else {
+                if ($sbit == "1") {
+                    $seqlo ^= $maskhi;
+                    # Prepare a unified header
+                    $data = pack('Cn', $content_type, $seqlo);
+                } else {
+                    $seqlo = ($seqlo & 0xff) ^ ($maskhi >> 8);
+                    # Prepare a unified header
+                    $data = pack('CC', $content_type, $seqlo);
+                }
+            }
         } else {
             $data = pack('Cnnnnnn', $content_type, $self->version,
                 $self->epoch, $seqhi, $seqmi, $seqlo, $self->len);
