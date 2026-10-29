@@ -148,7 +148,8 @@ static void dump_data(const char *data, int len)
         int rechdrlen;
 
         if (DTLS13_UNI_HDR_FIX_BITS_IS_SET(*rec))
-            rechdrlen = DTLS13_UNI_HDR_FIXED_LENGTH;
+            rechdrlen = 1 + (DTLS13_UNI_HDR_SEQ_BIT_IS_SET(*rec) ? 2 : 1) +
+                (DTLS13_UNI_HDR_LEN_BIT_IS_SET(*rec) ? 2 : 0);
         else
             rechdrlen = DTLS1_RT_HEADER_LENGTH;
 
@@ -169,11 +170,21 @@ static void dump_data(const char *data, int len)
 
             printf("** Record Epoch: %d\n", epoch);
             printf("** Record Sequence: ");
-            for (i = DTLS13_UNI_HDR_RECORD_SEQ_HI; i <= DTLS13_UNI_HDR_RECORD_SEQ_LO; i++)
-                printf("%02x", rec[i]);
-            reclen = (rec[DTLS13_UNI_HDR_RECORD_LEN_HI] << 8)
-                | rec[DTLS13_UNI_HDR_RECORD_LEN_LO];
-            printf("\n** Record Length: %d\n", reclen);
+            int len_off = 0;
+            if (DTLS13_UNI_HDR_SEQ_BIT_IS_SET(*rec)) {
+                for (i = DTLS13_UNI_HDR_RECORD_SEQ_HI; i <= DTLS13_UNI_HDR_RECORD_SEQ_LO; i++)
+                    printf("%02x", rec[i]);
+            } else {
+                printf("%02x", rec[DTLS13_UNI_HDR_RECORD_SEQ_HI]);
+                len_off = 1;
+            }
+            if (DTLS13_UNI_HDR_LEN_BIT_IS_SET(*rec)) {
+                reclen = (rec[DTLS13_UNI_HDR_RECORD_LEN_HI - len_off] << 8)
+                    | rec[DTLS13_UNI_HDR_RECORD_LEN_LO - len_off];
+                printf("\n** Record Length: %d\n", reclen);
+            } else {
+                reclen = rem - rechdrlen;
+            }
         } else {
             content = rec[RECORD_CONTENT_TYPE];
             printf("** Record Content-type: %d\n", content);
@@ -408,7 +419,8 @@ static int mempacket_test_read(BIO *bio, char *out, int outl)
             unsigned int rechdrlen;
 
             if (DTLS13_UNI_HDR_FIX_BITS_IS_SET(*rec))
-                rechdrlen = DTLS13_UNI_HDR_FIXED_LENGTH;
+                rechdrlen = 1 + (DTLS13_UNI_HDR_SEQ_BIT_IS_SET(*rec) ? 2 : 1) +
+                    (DTLS13_UNI_HDR_LEN_BIT_IS_SET(*rec) ? 2 : 0);
             else
                 rechdrlen = DTLS1_RT_HEADER_LENGTH;
 
@@ -436,8 +448,13 @@ static int mempacket_test_read(BIO *bio, char *out, int outl)
             }
 
             if (DTLS13_UNI_HDR_FIX_BITS_IS_SET(*rec))
-                len = (rec[DTLS13_UNI_HDR_RECORD_LEN_HI] << 8)
-                    | rec[DTLS13_UNI_HDR_RECORD_LEN_LO];
+                if (DTLS13_UNI_HDR_LEN_BIT_IS_SET(*rec)) {
+                    int len_off = DTLS13_UNI_HDR_SEQ_BIT_IS_SET(*rec) ? 0 : 1;
+                    len = (rec[DTLS13_UNI_HDR_RECORD_LEN_HI - len_off] << 8)
+                        | rec[DTLS13_UNI_HDR_RECORD_LEN_LO - len_off];
+                } else {
+                    len = rem - rechdrlen;
+                }
             else
                 len = (rec[RECORD_LEN_HI] << 8) | rec[RECORD_LEN_LO];
 
@@ -493,7 +510,8 @@ int mempacket_swap_epoch(BIO *bio)
         int rechdrlen;
 
         if (DTLS13_UNI_HDR_FIX_BITS_IS_SET(*rec))
-            rechdrlen = DTLS13_UNI_HDR_FIXED_LENGTH;
+            rechdrlen = 1 + (DTLS13_UNI_HDR_SEQ_BIT_IS_SET(*rec) ? 2 : 1) +
+                (DTLS13_UNI_HDR_LEN_BIT_IS_SET(*rec) ? 2 : 0);
         else
             rechdrlen = DTLS1_RT_HEADER_LENGTH;
 
@@ -505,8 +523,13 @@ int mempacket_swap_epoch(BIO *bio)
             if (epoch == 0)
                 epoch = 4;
 
-            len = ((rec[DTLS13_UNI_HDR_RECORD_LEN_HI] << 8)
-                | rec[DTLS13_UNI_HDR_RECORD_LEN_LO]);
+            if (DTLS13_UNI_HDR_LEN_BIT_IS_SET(*rec)) {
+                int len_off = DTLS13_UNI_HDR_SEQ_BIT_IS_SET(*rec) ? 0 : 1;
+                len = ((rec[DTLS13_UNI_HDR_RECORD_LEN_HI - len_off] << 8)
+                    | rec[DTLS13_UNI_HDR_RECORD_LEN_LO - len_off]);
+            } else {
+                len = rem - rechdrlen;
+            }
             len += rechdrlen;
         } else {
             epoch = (rec[RECORD_EPOCH_HI] << 8) | rec[RECORD_EPOCH_LO];
@@ -594,7 +617,8 @@ int mempacket_swap_epoch_dtls13(BIO *bio)
         int rechdrlen;
 
         if (DTLS13_UNI_HDR_FIX_BITS_IS_SET(*rec))
-            rechdrlen = DTLS13_UNI_HDR_FIXED_LENGTH;
+            rechdrlen = 1 + (DTLS13_UNI_HDR_SEQ_BIT_IS_SET(*rec) ? 2 : 1) +
+                (DTLS13_UNI_HDR_LEN_BIT_IS_SET(*rec) ? 2 : 0);
         else
             rechdrlen = DTLS1_RT_HEADER_LENGTH;
 
@@ -606,8 +630,13 @@ int mempacket_swap_epoch_dtls13(BIO *bio)
             if (epoch == 0)
                 epoch = 4;
 
-            len = ((rec[DTLS13_UNI_HDR_RECORD_LEN_HI] << 8)
-                | rec[DTLS13_UNI_HDR_RECORD_LEN_LO]);
+            if (DTLS13_UNI_HDR_LEN_BIT_IS_SET(*rec)) {
+                int len_off = DTLS13_UNI_HDR_SEQ_BIT_IS_SET(*rec) ? 0 : 1;
+                len = ((rec[DTLS13_UNI_HDR_RECORD_LEN_HI - len_off] << 8)
+                    | rec[DTLS13_UNI_HDR_RECORD_LEN_LO - len_off]);
+            } else {
+                len = rem - rechdrlen;
+            }
             len += rechdrlen;
         } else {
             epoch = (rec[RECORD_EPOCH_HI] << 8) | rec[RECORD_EPOCH_LO];
@@ -914,9 +943,11 @@ int mempacket_test_inject(BIO *bio, const char *in, int inl, int pktnum,
         && ossl_assert(!DTLS13_UNI_HDR_CID_BIT_IS_SET(*in))) {
         if (DTLS13_UNI_HDR_LEN_BIT_IS_SET(*in)) {
             len = 3; /* 2 bytes for len field and 1 byte for record type */
-            len += DTLS13_UNI_HDR_SEQ_BIT_IS_SET(*in) ? 2 : 1;
-            len += ((inu[DTLS13_UNI_HDR_RECORD_LEN_HI] << 8)
-                | inu[DTLS13_UNI_HDR_RECORD_LEN_LO]);
+            int sbit = DTLS13_UNI_HDR_SEQ_BIT_IS_SET(*in);
+            len += sbit ? 2 : 1;
+            int len_off = sbit ? 0 : 1;
+            len += ((inu[DTLS13_UNI_HDR_RECORD_LEN_HI - len_off] << 8)
+                | inu[DTLS13_UNI_HDR_RECORD_LEN_LO - len_off]);
         } else {
             /* We assert that inl is the correct record length */
             len = inl;
