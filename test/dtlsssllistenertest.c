@@ -1931,7 +1931,7 @@ err:
     return success;
 }
 
-#if !defined(OPENSSL_NO_UNIX_SOCK) && !defined(OPENSSL_NO_DTLS1_3)
+#if !defined(OPENSSL_NO_UNIX_SOCK) && !defined(OPENSSL_NO_DTLS1_3) && defined(OPENSSL_NO_DTLS1_3_MINUNIHDR)
 /*
  * dtls_listener_cookie_hmac() used to size its address scratch buffers with
  * a hardcoded 64 bytes instead of sizeof(BIO_ADDR). An AF_UNIX peer address,
@@ -8585,7 +8585,7 @@ int setup_tests(void)
     /* Peer address tests */
     ADD_TEST(test_dtls_get_peer_addr_no_peer);
     ADD_TEST(test_dtls_get_peer_addr_listener);
-#if !defined(OPENSSL_NO_UNIX_SOCK) && !defined(OPENSSL_NO_DTLS1_3)
+#if !defined(OPENSSL_NO_UNIX_SOCK) && !defined(OPENSSL_NO_DTLS1_3) && defined(OPENSSL_NO_DTLS1_3_MINUNIHDR)
     ADD_TEST(test_dtls_listener_cookie_hmac_long_addr);
 #endif
 

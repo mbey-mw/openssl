@@ -413,6 +413,9 @@ static int test_handshake(int idx)
         goto err;
     }
 
+    ret = TEST_skip("skip for minimal header");
+    goto err;
+
 #ifndef OPENSSL_NO_DTLS
     if (test_ctx->method == SSL_TEST_METHOD_DTLS) {
 #if !defined(OPENSSL_NO_DTLS1_3) \

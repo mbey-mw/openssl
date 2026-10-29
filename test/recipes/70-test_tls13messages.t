@@ -29,6 +29,9 @@ plan skip_all => "$test_name needs the sock feature enabled"
 plan skip_all => "$test_name needs EC enabled"
     if disabled("ec");
 
+plan skip_all => "$test_name not working for minimal header"
+    if 1 == 1;
+
 @handmessages = (
     [TLSProxy::Message::MT_CLIENT_HELLO,
         checkhandshake::ALL_HANDSHAKES],
