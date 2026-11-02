@@ -139,6 +139,7 @@ sub init
         record_list => [],
         message_list => [],
         seen_msgseq => {},
+        dgram_count => 0,
     };
 
     return bless $self, $class;
@@ -163,6 +164,7 @@ sub clearClient
     $self->{record_list} = [];
     $self->{message_list} = [];
     $self->{seen_msgseq} = {};
+    $self->{dgram_count} = 0;
     $self->{clientflags} = "";
     $self->{sessionfile} = undef;
     $self->{expected_tickets} = 2;
@@ -523,8 +525,8 @@ sub clientstart
         foreach my $hand (@ready) {
             if ($hand == $server_sock) {
                 if ($server_sock->sysread($indata, 16384)) {
-                    if ($indata = $self->process_packet(1, $indata)) {
-                        if (!$self->client_syswrite($client_sock, $indata)) {
+                    foreach my $datagram ($self->process_packet(1, $indata)) {
+                        if (!$self->client_syswrite($client_sock, $datagram)) {
                             # For DTLS/UDP, syswrite failure after handshake completion
                             # is not necessarily an error - the client may have already
                             # sent close_notify and exited. Unlike TCP, UDP is
@@ -548,8 +550,8 @@ sub clientstart
                 }
             } elsif ($hand == $client_sock) {
                 if ($self->client_sysread($client_sock, \$indata)) {
-                    if ($indata = $self->process_packet(0, $indata)) {
-                        if (!$server_sock->syswrite($indata)) {
+                    foreach my $datagram ($self->process_packet(0, $indata)) {
+                        if (!$server_sock->syswrite($datagram)) {
                             # For DTLS/UDP, syswrite failure after handshake completion
                             # is not necessarily an error - the server may have already
                             # sent close_notify and exited. Unlike TCP, UDP is
@@ -763,7 +765,16 @@ sub process_packet
     print "\n";
 
     if (scalar(@{$ret[0]}) == 0 or length($ret[2]) != 0) {
-        return "";
+        # Deferring here leaves whatever was already parsed sitting in
+        # record_list until the next packet from this direction.  That is only
+        # harmless because the reconstruction below emits one datagram per
+        # unified record, so a deferred record can never end up sharing a
+        # datagram with the records that follow it.
+        my $pending = grep { !$_->{sent} && ($_->{flight} & 1) == $serverissender }
+                      @{$self->{record_list}};
+        print "NOTE: DEFERRED dir=".$serverissender." pending=".$pending
+              ." partial=".length($ret[2])."\n" if $pending > 0;
+        return ();
     }
 
     #Finished parsing. Call user provided filter here
@@ -793,10 +804,16 @@ sub process_packet
         }
     }
 
-    #Reconstruct the packet
-    $packet = "";
+    #Reconstruct the packet.
+    #A DTLS 1.3 unified header with L=0 carries no length field, so the record
+    #it describes runs to the end of the datagram (dtls_meth.c reads the
+    #remainder as its body).  A second record behind it would be swallowed, so
+    #each unified record is emitted as a datagram of its own.  Legacy records
+    #-- epoch 0, TLS, or a no-dtls1_3_minunihdr build -- still coalesce.
+    my @groups = ();
+    my @current = ();
     foreach my $record (@{$self->record_list}) {
-        $packet .= $record->reconstruct_record($serverissender);
+        my $record_data = $record->reconstruct_record($serverissender);
 
         # After we have set the saw_session_ticket flag, we can check if we have
         # seen a session ticket ack. This is only relevant for DTLSv1.3
@@ -815,11 +832,34 @@ sub process_packet
                 $self->{$seq_key} = $rec_seq;
             }
         }
+
+        # reconstruct_record() returns "" for records already sent or from the
+        # other direction
+        next if !length $record_data;
+
+        if ($record->unified) {
+            push @groups, [@current] if @current;
+            @current = ();
+            push @groups, [[$record, $record_data]];
+        } else {
+            push @current, [$record, $record_data];
+        }
+    }
+    push @groups, [@current] if @current;
+
+    my @out = ();
+    foreach my $group (@groups) {
+        my $datagram = "";
+        foreach my $item (@{$group}) {
+            $item->[0]->{dgram} = $self->{dgram_count};
+            $datagram .= $item->[1];
+        }
+        print "Forwarded packet length = ".length($datagram)."\n\n";
+        push @out, $datagram;
+        $self->{dgram_count}++;
     }
 
-    print "Forwarded packet length = ".length($packet)."\n\n";
-
-    return $packet;
+    return @out;
 }
 
 sub seen_session_ticket_ack

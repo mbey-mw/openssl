@@ -44,12 +44,14 @@ my $proxy = TLSProxy::Proxy->new_dtls(
     have_IPv6()
 );
 
-my $testcount = 4;
+my $testcount = 5;
 
 plan tests => $testcount;
 (undef, my $session) = tempfile();
 my $found_first_client_finish_msg = 0;
 my $truncated_ack = 0;
+my $short_ack;
+my $ack_copy;
 
 #Test 1: Check that records are acked during an uninterrupted handshake
 $proxy->serverflags("-min_protocol DTLSv1.3 -max_protocol DTLSv1.3");
@@ -110,8 +112,10 @@ SKIP: {
 
     # Test 4: An ACK body of exactly DTLS1_HM_HEADER_LENGTH bytes fills the
     # read that looks for a message header and exhausts its record doing so.
-    # The record that follows it in the same datagram must not then be read
-    # as the rest of the ACK.
+    # The record that follows it must not then be read as the rest of the ACK.
+    # The proxy guarantees that by emitting one unified record per datagram;
+    # under minimal unified headers it is the only thing that can, because the
+    # first record's length is the remainder of the datagram.
     $proxy->clear();
     $proxy->filter(\&short_ack_filter);
     $proxy->serverflags("-min_protocol DTLSv1.3 -max_protocol DTLSv1.3");
@@ -123,7 +127,13 @@ SKIP: {
         && defined(TLSProxy::Message->alert())
         && TLSProxy::Message->alert()->description()
            == TLSProxy::Message::AL_DESC_ILLEGAL_PARAMETER,
-        "Check a short ACK does not consume the record after it");
+        "Check a short ACK is rejected");
+
+    ok(defined $short_ack && defined $ack_copy
+        && $short_ack->{sent} == 1 && $ack_copy->{sent} == 1
+        && defined $short_ack->{dgram} && defined $ack_copy->{dgram}
+        && $short_ack->{dgram} != $ack_copy->{dgram},
+        "Check the record after a short ACK leaves the proxy in its own datagram");
 }
 
 unlink $session;
@@ -227,11 +237,13 @@ sub drop_first_client_finish_filter
 }
 
 # Truncate the server's ACK to a 12 byte body and follow it with a copy of the
-# original in the same datagram. The truncated body claims a record number list
-# of 16 bytes but carries 10, so it fills the initial DTLS1_HM_HEADER_LENGTH
-# read, leaves its record empty, and cannot be parsed from that record alone. A
-# peer that reads the rest of the body from the record behind it gets a list it
-# can parse, and loses that record.
+# original. The truncated body claims a record number list of 16 bytes but
+# carries 10, so it fills the initial DTLS1_HM_HEADER_LENGTH read, leaves its
+# record empty, and cannot be parsed from that record alone. A peer that reads
+# the rest of the body from whatever follows gets a list it can parse, and
+# loses that record; with a minimal unified header the following bytes are
+# simply the remainder of the same datagram. The proxy keeps the two apart by
+# sending one unified record per datagram, which test 5 asserts.
 sub short_ack_filter
 {
     my $inproxy = shift;
@@ -270,6 +282,8 @@ sub short_ack_filter
             $record->decrypt_data($body);
             $record->decrypt_len(length $body);
 
+            $short_ack = $record;
+            $ack_copy = $copy;
             splice @{$records}, $idx + 1, 0, $copy;
             $truncated_ack = 1;
             return;
