@@ -15,6 +15,13 @@ my $server_encrypting = 0;
 my $client_encrypting = 0;
 my $etm = 0;
 
+# Per-direction view of the peer's epoch, and the right edge of its replay
+# window per (direction, epoch).  A unified header carries only epoch mod 4
+# and 8 or 16 bits of the sequence number, so both have to be reconstructed
+# from what has already been seen from that direction, as the receiver does.
+my %epoch_seen;
+my %seq_window;
+
 use constant DTLS_RECORD_HEADER_LENGTH => 13;
 use constant TLS_RECORD_HEADER_LENGTH => 5;
 
@@ -81,6 +88,78 @@ our %tls_version = (
     VERS_SSL_3_0, "SSL3",
     VERS_SSL_LT_3_0, "SSL<3"
 );
+
+# Port of dtls13_reconstruct_seq_num() (ssl/record/methods/dtls_meth.c).
+# Selects the candidate closest to the right edge of the replay window plus
+# one, ignoring candidates outside the sequence-number range and breaking ties
+# forward.  An empty window is represented by max_seq_num == 0.  Sequence
+# numbers near 2**64 are unreachable in a proxy session, so the UINT64_MAX
+# wrap handling of the C original is left out.
+sub dtls13_reconstruct_seq_num
+{
+    my ($max_seq_num, $truncated, $seqlen) = @_;
+
+    my $mask = (1 << (8 * $seqlen)) - 1;
+    my $period = $mask + 1;
+    my $expected = $max_seq_num + 1;
+
+    # The candidate in the same period-sized block as $expected
+    my $candidate = ($expected & ~$mask) | $truncated;
+    my $best = $candidate;
+    my $best_dist = abs($candidate - $expected);
+
+    # The candidate one period behind, if it does not underflow
+    if ($candidate >= $period) {
+        my $alt = $candidate - $period;
+        my $dist = abs($alt - $expected);
+        # Strictly closer only: a tie goes to the forward candidate
+        if ($dist < $best_dist) {
+            $best = $alt;
+            $best_dist = $dist;
+        }
+    }
+
+    # The candidate one period ahead
+    my $alt = $candidate + $period;
+    my $dist = abs($alt - $expected);
+    # Ties go forward
+    if ($dist <= $best_dist) {
+        $best = $alt;
+    }
+
+    return $best;
+}
+
+# The wire carries epoch mod 4 -- dtls_prepare_record_header() writes
+# rl->epoch & DTLS13_UNI_HDR_EPOCH_BITS_MASK -- so it is resolved against the
+# epochs already seen from this direction: the candidate congruent to $ee
+# modulo 4 that is closest to the next expected epoch, without going backwards.
+# Epoch 0 is never sent with a unified header, so 1 is the lowest candidate.
+#
+# Monotone by design, which means a retransmission of a record from an epoch
+# more than three epochs behind the current one resolves too far forward.  The
+# proxy keeps no epoch list, so it cannot do better, and no recipe exercises
+# that today.
+sub resolve_epoch
+{
+    my ($serverissender, $ee) = @_;
+
+    my $current = $epoch_seen{$serverissender} // 0;
+    my $lowest = $current < 1 ? 1 : $current;
+    my $expected = $current + 1;
+
+    # First candidate at or after $expected with candidate % 4 == $ee
+    my $best = $expected + ((($ee - $expected) % 4) + 4) % 4;
+    my $best_dist = $best - $expected;
+
+    my $alt = $best - 4;
+    if ($alt >= $lowest && $expected - $alt < $best_dist) {
+        $best = $alt;
+    }
+
+    $epoch_seen{$serverissender} = $best if $best > $current;
+    return $best;
+}
 
 #Class method to extract records from a packet of data
 sub get_records
@@ -150,23 +229,26 @@ sub get_records
                 (my $maskhi, my $maskmi, my $masklo) = unpack('nnn', $recordbody);
                 $version = VERS_DTLS_1_2; # DTLSv1.3 headers has DTLSv1.2 in its legacy_version field
 
-                if ($eebits == "00") {
-                    $epoch = 4; # must be at least 4 since 0 epoch are not sent with unified hdr
-                } elsif ($eebits == "01") {
-                    $epoch = 1;
-                } elsif ($eebits == "10") {
-                    $epoch = 2;
-                } elsif ($eebits == "11") {
-                    $epoch = 3;
-                } else {
-                    die("Epoch bits is not 0's or 1's: should not happen")
-                }
+                die("Epoch bits is not 0's or 1's: should not happen")
+                    unless $eebits =~ /^[01]{2}$/;
+                $epoch = resolve_epoch($serverissender, oct("0b$eebits"));
 
                 if ($sbit == "1") {
                     $seq ^= $maskhi;
                 } else {
                     $seq ^= $maskhi >> 8;
                 }
+
+                # The wire carries only 8 or 16 bits of the sequence number, so
+                # the full value has to come from this (direction, epoch) replay
+                # window, as dtls_get_records() does. The low bits still equal
+                # the truncated wire value, which is what reconstruct_record()
+                # masks back and re-serialises.
+                my $winkey = $serverissender . ':' . $epoch;
+                my $max_seq_num = $seq_window{$winkey} // 0;
+                $seq = dtls13_reconstruct_seq_num($max_seq_num, $seq,
+                                                  $sbit == "1" ? 2 : 1);
+                $seq_window{$winkey} = $seq if $seq > $max_seq_num;
             } else {
                 my $seqhi;
                 my $seqmi;
@@ -274,6 +356,8 @@ sub clear
 {
     $server_encrypting = 0;
     $client_encrypting = 0;
+    %epoch_seen = ();
+    %seq_window = ();
 }
 
 #Class level accessors
