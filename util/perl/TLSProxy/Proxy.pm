@@ -821,7 +821,12 @@ sub construct_alert_message
 {
     my ($self, $epoch, $sequence_number, $serverissender) = @_;
 
-    die "construct_alert_message only valid for DTLSv1.3 tests\n"
+    die "construct_alert_message() is not supported outside DTLSv1.3: the"
+        ." close_notify it builds is a unified-header record, so it needs an"
+        ." epoch and a replay window that TLS and DTLSv1.2 do not have."
+        ." Blocks any subtest that calls it on a non-DTLSv1.3 connection; the"
+        ." proxy's own teardown use is 70-test_dtls13sessionid.t and"
+        ." 70-test_dtls13records.t\n"
         if !$self->{isdtls} || !$self->is_tls13();
 
     my $alert_level = pack("C", 1);                # Warning (1)

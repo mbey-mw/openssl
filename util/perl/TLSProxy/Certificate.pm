@@ -114,12 +114,19 @@ sub parse
             $self->first_certificate($certdata);
             $self->remaining_certdata($remdata);
         } elsif ($type == TLSEXT_cert_type_rpk) {
-            die "Post %s RPK content\n", $self->server() ? "server" : "client"
+            die sprintf("Post %s RPK content",
+                        $self->server() ? "server" : "client")
                 if ($remdata ne "");
             $self->rpk($certdata);
         } else {
-            die "Unsupported %s certificate type: %d\n",
-                $self->server() ? "server" : "client", $type;
+            die sprintf("Unsupported %s certificate type: %d in a TLSv1.3"
+                        ." Certificate; the proxy parses only"
+                        ." TLSEXT_cert_type_x509 and TLSEXT_cert_type_rpk, so"
+                        ." OpenPGP (1) and the unrestricted OID (4) types are"
+                        ." unavailable to 70-test_certtypeext.t tests 2-4,"
+                        ." which inject exactly that list and reach this only"
+                        ." if the peer accepts one",
+                        $self->server() ? "server" : "client", $type);
         }
 
         print "    Context:".$context."\n";
@@ -163,8 +170,14 @@ sub parse
 
             print "    RPK LEN:".$certlistlen."\n";
         } else {
-            die "Unsupported %s certificate type: %d\n",
-                $self->server() ? "server" : "client", $type;
+            die sprintf("Unsupported %s certificate type: %d in a"
+                        ." pre-TLSv1.3 Certificate; the proxy parses only"
+                        ." TLSEXT_cert_type_x509 and TLSEXT_cert_type_rpk, so"
+                        ." OpenPGP (1) and the unrestricted OID (4) types are"
+                        ." unavailable to 70-test_certtypeext.t tests 2-4,"
+                        ." which inject exactly that list and reach this only"
+                        ." if the peer accepts one",
+                        $self->server() ? "server" : "client", $type);
         }
     }
 }

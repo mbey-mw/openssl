@@ -684,7 +684,16 @@ sub repack
                 }
                 $rec->data($data);
             } else {
-                die "Unsupported encryption: No ETM";
+                die "repack() cannot re-encrypt this record: it supports"
+                    ." only TLSv1.3, and pre-TLSv1.3 records that negotiated"
+                    ." encrypt-then-MAC (Record->etm() comes from"
+                    ." EXT_ENCRYPT_THEN_MAC in ClientHello.pm), because"
+                    ." otherwise the MAC and padding cannot be rebuilt."
+                    ." Blocks the encrypted-record subtests of"
+                    ." 70-test_renegotiation.t, the one recipe that re-packs"
+                    ." a pre-TLSv1.3 encrypted record; s_client and s_server"
+                    ." negotiate ETM by default, so this fires only when that"
+                    ." is turned off";
             }
         } else {
             $rec->data($rec->decrypt_data);
