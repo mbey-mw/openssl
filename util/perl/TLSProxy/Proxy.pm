@@ -140,6 +140,7 @@ sub init
         message_list => [],
         seen_msgseq => {},
         dgram_count => 0,
+        partial_dropped => 0,
     };
 
     return bless $self, $class;
@@ -165,6 +166,7 @@ sub clearClient
     $self->{message_list} = [];
     $self->{seen_msgseq} = {};
     $self->{dgram_count} = 0;
+    $self->{partial_dropped} = 0;
     $self->{clientflags} = "";
     $self->{sessionfile} = undef;
     $self->{expected_tickets} = 2;
@@ -590,7 +592,7 @@ sub clientstart
     print "Connection closed\n";
     if($server_sock) {
         if ($self->{isdtls} && $self->is_tls13()) {
-            my $alert_message = $self->construct_alert_message($self->{client_epoch}, $self->{client_sequence_number} + 1);
+            my $alert_message = $self->construct_alert_message($self->{client_epoch}, $self->{client_sequence_number} + 1, 0);
             $server_sock->syswrite($alert_message) or warn "Failed to send close_notify alert: $!\n";
         }
         $server_sock->close();
@@ -600,7 +602,7 @@ sub clientstart
         # For DTLSv1.3 tests that are using sessionfile we need to send a close_notify
         # this is because closing the socket does not result in a FIN being sent as in TCP.
         if ($self->{isdtls} && $self->is_tls13() && defined($self->{sessionfile})) {
-            my $alert_message = $self->construct_alert_message($self->{server_epoch}, $self->{server_sequence_number} + 1);
+            my $alert_message = $self->construct_alert_message($self->{server_epoch}, $self->{server_sequence_number} + 1, 1);
             $self->client_syswrite($client_sock, $alert_message)
                 or warn "Failed to send close_notify alert: $!\n";
         }
@@ -687,7 +689,7 @@ sub client_syswrite
 
 sub construct_alert_message
 {
-    my ($self, $epoch, $sequence_number) = @_;
+    my ($self, $epoch, $sequence_number, $serverissender) = @_;
 
     die "construct_alert_message only valid for DTLSv1.3 tests\n"
         if !$self->{isdtls} || !$self->is_tls13();
@@ -713,17 +715,17 @@ sub construct_alert_message
     # Keyed epochs use DTLSCiphertext. The p_ossltest cipher leaves the
     # payload unchanged and does not verify the tag. The inner plaintext
     # holds close_notify and its content type; a zero tag follows.
-    # The header uses a 16 bit sequence number and a length field. Mask the
-    # sequence number with the first two payload bytes, as in Record.pm.
-    my $payload = $alert_payload.pack("C", 21).("\x00" x 16);
-    my $maskhi = unpack("n", substr($payload, 0, 2));
-    my $seqlo = ($sequence_number & 0xffff) ^ $maskhi;
-    my $first = 0x20 | 0x08 | 0x04 | ($epoch & 0x03);
+    # Emit the header shape the peer actually uses on this connection. The
+    # S=1,L=1 form this used to hardcode is produced by no record layer in
+    # either build, so it was the only S=1 or L=1 header in the whole suite.
+    my $payload = $alert_payload.pack("C", TLSProxy::Record::RT_ALERT)
+                    .("\x00" x TLSProxy::Record::DTLS13_CIPHERTEXT_MINSIZE());
+    my ($sbit, $lbit) = TLSProxy::Record->uni_shape($serverissender);
+    my $first = 0x20 | ($sbit << 3) | ($lbit << 2) | ($epoch & 0x03);
 
-    return pack("C", $first).
-           pack("n", $seqlo).
-           pack("n", length($payload)).
-           $payload;
+    return TLSProxy::Record::encode_unified_header($first, $sequence_number,
+                                                   length($payload), $payload)
+           .$payload;
 }
 
 sub process_packet
@@ -746,9 +748,21 @@ sub process_packet
 
     #Return contains the list of record found in the packet followed by the
     #list of messages in those records and any partial message
+    #
+    #"partial" is a TCP concept.  A UDP datagram is never continued by the next
+    #one, so a truncated one has to be dropped, not stitched onto unrelated
+    #later traffic from the same direction where it would corrupt both.
+    my $carry = $self->{isdtls} ? "" : $self->{partial}[$serverissender];
     my @ret = TLSProxy::Record->get_records($serverissender, $self->flight,
-                                            $self->{partial}[$serverissender].$packet,
+                                            $carry.$packet,
                                             $self->{isdtls});
+
+    if ($self->{isdtls} && length($ret[2]) != 0) {
+        $self->{partial_dropped}++;
+        print "NOTE: DROPPED truncated datagram dir=".$serverissender
+              ." bytes=".length($ret[2])."\n";
+        $ret[2] = "";
+    }
 
     $self->{partial}[$serverissender] = $ret[2];
     push @{$self->{record_list}}, @{$ret[0]};
@@ -955,6 +969,12 @@ sub record_list
 {
     my $self = shift;
     return $self->{record_list};
+}
+# Datagrams discarded because they ended mid-record.
+sub partial_dropped
+{
+    my $self = shift;
+    return $self->{partial_dropped};
 }
 sub success
 {

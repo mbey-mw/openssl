@@ -22,8 +22,23 @@ my $etm = 0;
 my %epoch_seen;
 my %seq_window;
 
+# Shape of the unified headers this connection actually uses, per direction:
+# the S and L bits of the last record parsed from it.  Records the proxy builds
+# itself should match the peer rather than a hardcoded shape.
+my %uni_shape;
+
+# Records discarded instead of parsed, so a recipe can assert on the drop.
+my $cid_dropped = 0;
+my $short_dropped = 0;
+
 use constant DTLS_RECORD_HEADER_LENGTH => 13;
 use constant TLS_RECORD_HEADER_LENGTH => 5;
+
+# A DTLSCiphertext body has to hold at least an AEAD tag and the trailing inner
+# content type byte. DTLS13_CIPHERTEXT_MINSIZE is include/openssl/dtls1.h; the
+# receiver enforces it at ssl/record/methods/dtls_meth.c.
+use constant DTLS13_CIPHERTEXT_MINSIZE => 16;
+use constant DTLS13_UNI_BODY_MIN => DTLS13_CIPHERTEXT_MINSIZE + 1;
 
 #Record types
 use constant {
@@ -46,23 +61,22 @@ my %record_type = (
     RT_CCS, "CCS",
     RT_ACK, "ACK",
     RT_UNKNOWN, "UNKNOWN",
-    0x20, "DTLS UNIFIED HEADER (EPOCH 4)",
-    0x21, "DTLS UNIFIED HEADER (EPOCH 1)",
-    0x22, "DTLS UNIFIED HEADER (EPOCH 2)",
-    0x23, "DTLS UNIFIED HEADER (EPOCH 3)",
-    0x24, "DTLS UNIFIED HEADER (EPOCH 4)",
-    0x25, "DTLS UNIFIED HEADER (EPOCH 1)",
-    0x26, "DTLS UNIFIED HEADER (EPOCH 2)",
-    0x27, "DTLS UNIFIED HEADER (EPOCH 3)",
-    0x28, "DTLS UNIFIED HEADER (EPOCH 4)",
-    0x29, "DTLS UNIFIED HEADER (EPOCH 1)",
-    0x21, "DTLS UNIFIED HEADER (EPOCH 2)",
-    0x2b, "DTLS UNIFIED HEADER (EPOCH 3)",
-    RT_DTLS_UNIHDR_EPOCH4, "DTLS UNIFIED HEADER (EPOCH 4)",
-    RT_DTLS_UNIHDR_EPOCH1, "DTLS UNIFIED HEADER (EPOCH 1)",
-    RT_DTLS_UNIHDR_EPOCH2, "DTLS UNIFIED HEADER (EPOCH 2)",
-    RT_DTLS_UNIHDR_EPOCH3, "DTLS UNIFIED HEADER (EPOCH 3)",
 );
+
+# The sixteen unified first bytes, generated from the bit definitions so a
+# mistyped key cannot silently shadow another one: 0x21 was written twice and
+# 0x2a was missing, so S=0,L=0,EE=01 printed "EPOCH 2" and S=1,L=0,EE=10
+# printed nothing. Epoch 0 is never carried by a unified header, so the EE bits
+# name epochs 1..4 and the label keeps the RFC 9147 section 4.2.3 spelling.
+my @uni_epoch_of = (4, 1, 2, 3);
+for my $s (0, 1) {
+    for my $l (0, 1) {
+        for my $ee (0 .. 3) {
+            $record_type{0x20 | ($s << 3) | ($l << 2) | $ee} =
+                "DTLS UNIFIED HEADER (EPOCH $uni_epoch_of[$ee])";
+        }
+    }
+}
 
 use constant {
     VERS_DTLS_1_3 => 0xfefc,
@@ -161,6 +175,32 @@ sub resolve_epoch
     return $best;
 }
 
+# Serialise a unified header and hand it back, the single place that knows the
+# shape rules.  $first is the numeric first byte, carrying the fix bits and the
+# C, S, L and EE bits; the sequence number is masked with the leading bytes of
+# the body exactly as dtls_prepare_record_header() does, so passing the
+# reconstructed value puts the original truncated bits back on the wire (see
+# the note in get_records() about the ossltest no-op cipher).  $len is only
+# emitted when L is set.
+sub encode_unified_header
+{
+    my ($first, $seq, $len, $body) = @_;
+
+    $body = '' unless defined $body;
+    my ($sbit, $lbit) = ($first & 0x08 ? 1 : 0, $first & 0x04 ? 1 : 0);
+    my ($maskhi) = unpack('n', substr($body . "\0\0", 0, 2));
+
+    my $hdr = chr($first);
+    if ($sbit) {
+        $hdr .= pack('n', ($seq & 0xffff) ^ $maskhi);
+    } else {
+        $hdr .= pack('C', ($seq & 0xff) ^ ($maskhi >> 8));
+    }
+    $hdr .= pack('n', $len) if $lbit;
+
+    return $hdr;
+}
+
 #Class method to extract records from a packet of data
 sub get_records
 {
@@ -199,28 +239,59 @@ sub get_records
                 my $eebits = substr($content_type, 6, 2);
 
                 if ($cbit == "1") {
-                    die("TLSProxy does not support set Connection ID in DTLSv1.3 unified header bits");
+                    # The record layer silently discards a record whose
+                    # Connection ID bit is set (dtls_get_more_records() in
+                    # ssl/record/methods/dtls_meth.c).  Dying here took the
+                    # whole recipe down with it.
+                    $cid_dropped++;
+                    print "  Connection ID in a unified header is not"
+                          ." supported, dropping the datagram\n";
+                    $packet = "";
+                    last;
+                }
+                $uni_shape{$serverissender} = substr($packet, 0, 1);
+
+                $record_hdr_len = 2 + ($sbit == "1" ? 1 : 0)
+                                     + ($lbit == "1" ? 2 : 0);
+                # A datagram that does not even hold the header is truncated.
+                # Unpacking it anyway yields an undef length, and the record
+                # ends up claiming a negative one.
+                if (length($packet) < $record_hdr_len) {
+                    print "Partial data : ".length($packet)." bytes\n";
+                    $partial = $packet;
+                    last;
                 }
 
                 # This is a unified header
                 if ($lbit == "1") {
                     if ($sbit == "1") {
                         ($content_type, $seq, $len) = unpack('Cnn', $packet);
-                        $record_hdr_len = 5;
                     } else {
                         ($content_type, $seq, $len) = unpack('CCn', $packet);
-                        $record_hdr_len = 4;
                     }
                 } else {
                     if ($sbit == "1") {
                         ($content_type, $seq) = unpack('Cn', $packet);
-                        $record_hdr_len = 3;
                     } else {
                         ($content_type, $seq) = unpack('CC', $packet);
-                        $record_hdr_len = 2;
                     }
                     $len = length($packet) - $record_hdr_len;
                 }
+
+                # The receiver requires at least DTLS13_CIPHERTEXT_MINSIZE
+                # bytes of ciphertext plus the trailing inner content type.  A
+                # shorter body would hand decrypt() a negative substr length,
+                # which Perl reads as "strip from the end" and returns as
+                # plaintext.
+                if ($len < DTLS13_UNI_BODY_MIN) {
+                    print "  Unified record body of $len bytes is too short,"
+                          ." dropping\n";
+                    $short_dropped++;
+                    $packet = substr($packet, $record_hdr_len + $len);
+                    $recnum++;
+                    next;
+                }
+
                 # Encrypted DTLS 1.3 records have encrypted sequence numbers.
                 # ossltest engine overrides ecb encryption to be a no-op.
                 # This effectively means that the sequence number encryption mask
@@ -358,6 +429,32 @@ sub clear
     $client_encrypting = 0;
     %epoch_seen = ();
     %seq_window = ();
+    %uni_shape = ();
+    $cid_dropped = 0;
+    $short_dropped = 0;
+}
+
+# Read-only counters for the two ways a unified record is discarded rather than
+# parsed: the Connection ID bit is set, or the body is too short to de-protect.
+sub cid_dropped
+{
+    return $cid_dropped;
+}
+sub short_dropped
+{
+    return $short_dropped;
+}
+
+# The (S, L) bit pair of the unified headers seen from $serverissender, defaulting
+# to the minimal header when nothing has been parsed from that direction yet.
+sub uni_shape
+{
+    my ($class, $serverissender) = @_;
+    my $shape = $uni_shape{$serverissender // 0};
+
+    return defined $shape ? (ord($shape) & 0x08 ? 1 : 0,
+                             ord($shape) & 0x04 ? 1 : 0)
+                          : (0, 0);
 }
 
 #Class level accessors
@@ -637,33 +734,14 @@ sub reconstruct_record
     my $content_type = ($self->{unified} || $self->{aead_unwrapped})
                        ? $self->outer_content_type : $self->content_type;
     if($self->{isdtls}) {
-        my $seqhi = ($self->seq >> 32) & 0xffff;
-        my $seqmi = ($self->seq >> 16) & 0xffff;
-        my $seqlo = ($self->seq >> 0) & 0xffff;
-
         if ($self->{unified}) {
-            # Mask sequence number with record body bytes. Explanation
-            # given in get_records.
-            (my $maskhi, my $maskmi, my $masklo) = unpack("nnn", $self->data);
-
-            if ($self->{unified_lbit}) {
-                if ($self->{unified_sbit}) {
-                    $seqlo ^= $maskhi;
-                    $data = pack('Cnn', $content_type, $seqlo, $self->len);
-                } else {
-                    $seqlo = ($seqlo & 0xff) ^ ($maskhi >> 8);
-                    $data = pack('CCn', $content_type, $seqlo, $self->len);
-                }
-            } else {
-                if ($self->{unified_sbit}) {
-                    $seqlo ^= $maskhi;
-                    $data = pack('Cn', $content_type, $seqlo);
-                } else {
-                    $seqlo = ($seqlo & 0xff) ^ ($maskhi >> 8);
-                    $data = pack('CC', $content_type, $seqlo);
-                }
-            }
+            $data = encode_unified_header($content_type, $self->seq,
+                                          $self->len, $self->data);
         } else {
+            my $seqhi = ($self->seq >> 32) & 0xffff;
+            my $seqmi = ($self->seq >> 16) & 0xffff;
+            my $seqlo = ($self->seq >> 0) & 0xffff;
+
             $data = pack('Cnnnnnn', $content_type, $self->version,
                 $self->epoch, $seqhi, $seqmi, $seqlo, $self->len);
         }
