@@ -141,6 +141,10 @@ sub init
         seen_msgseq => {},
         dgram_count => 0,
         partial_dropped => 0,
+        client_stdin_holder => undef,
+        hold_client_stdin => 0,
+        server_killed => 0,
+        client_killed => 0,
     };
 
     return bless $self, $class;
@@ -167,6 +171,8 @@ sub clearClient
     $self->{seen_msgseq} = {};
     $self->{dgram_count} = 0;
     $self->{partial_dropped} = 0;
+    $self->close_client_stdin();
+    $self->{hold_client_stdin} = 0;
     $self->{clientflags} = "";
     $self->{sessionfile} = undef;
     $self->{expected_tickets} = 2;
@@ -447,6 +453,23 @@ sub clientstart
         }
         $self->{clientpid} = $pid;
 
+        # Normally restoring STDOUT below closes the client's stdin, and that
+        # EOF is what makes s_client shut the connection down once it has sent
+        # its request.  A test that needs the connection to survive the
+        # handshake asks for hold_client_stdin() first, which keeps a second
+        # reference to the write end so the client stays put; it then drives
+        # the client itself via write_to_client_stdin() and ends the run with
+        # close_client_stdin().
+        if ($self->{hold_client_stdin}) {
+            my $client_stdin;
+            unless (open($client_stdin, ">&", \*STDOUT)) {
+                my $err = $!;
+                kill(3, $self->{real_serverpid});
+                die "Failed to dup client stdin: $err\n";
+            }
+            $self->{client_stdin_holder} = $client_stdin;
+        }
+
         # queue [magic] input
         print $self->reneg ? "R" : "test";
 
@@ -485,6 +508,8 @@ sub clientstart
     my @ready;
     my $ctr = 0;
     local $SIG{PIPE} = "IGNORE";
+    $self->{server_killed} = 0;
+    $self->{client_killed} = 0;
     $self->{saw_session_ticket} = undef;
     $self->{session_ticket_seq} = [];
     $self->{saw_session_ticket_ack} = {};
@@ -583,6 +608,10 @@ sub clientstart
     }
 
     if ($ctr >= 50) {
+        # Deliberate: a wedged s_server has to be made to let go of its output
+        # pipe or the sink below is never waited for.  Record it so the
+        # teardown does not read the resulting signal death as a failure.
+        $self->{server_killed} = 1;
         kill(3, $self->{real_serverpid});
         print "No progress made\n";
         $success = 0;
@@ -636,7 +665,8 @@ sub clientstart
         # it's done already, just collect the exit code [and reap]...
         waitpid($pid, 0);
 
-        die "exit code $? from s_server process\n" if $? != 0;
+        die "exit code $? from s_server process\n"
+            if $? != 0 && !$self->{server_killed};
     } else {
         # It's a bit counter-intuitive spot to make next connection to
         # the s_server. Rationale is that established connection works
@@ -645,11 +675,58 @@ sub clientstart
         $self->connect_to_server();
     }
     $pid = $self->{clientpid};
+    # Let the client see EOF so it exits if the test did not hang it up already.
+    $self->close_client_stdin();
     print "Waiting for s_client process to close: $pid...\n";
-    waitpid($pid, 0);
-    $self->{clientexit} = $?;
+    # A client whose handshake never completed has nothing to shut down with --
+    # the close_notify the proxy constructs itself is not decryptable -- so it
+    # can sit out its DTLS retransmit timer instead of exiting.  Give it a
+    # bounded grace, then make it let go the way the no-progress path does for
+    # s_server, and do not read that death as a client failure.
+    my $reaped = 0;
+    my $waited = 0;
+    while ($waited < 100) {
+        my $r = waitpid($pid, POSIX::WNOHANG);
+        if ($r == $pid) {
+            $reaped = 1;
+            last;
+        }
+        last if $r == -1;
+        select(undef, undef, undef, 0.1);
+        $waited++;
+    }
+    if (!$reaped) {
+        print "s_client did not exit, killing it\n";
+        $self->{client_killed} = 1;
+        # The pipe open goes through a shell, so the pid we hold may be that
+        # shell waiting on s_client.  Killing only it orphans s_client, which
+        # keeps the harness's stdout pipe open and stalls the whole run.
+        kill_process_tree($pid);
+        waitpid($pid, 0);
+    }
+    $self->{clientexit} = $? unless $self->{client_killed};
 
     return $success;
+}
+
+# Signal a process and everything below it.  /proc is the only portable-enough
+# way to get the child list from Perl; where it is missing this degrades to
+# killing just the pid, which is what the code did before.
+sub kill_process_tree
+{
+    my ($pid) = @_;
+
+    return if !defined($pid) || $pid !~ /^\d+$/;
+
+    my @kids;
+    if (open(my $ch, "<", "/proc/$pid/task/$pid/children")) {
+        local $/ = undef;
+        my $line = <$ch>;
+        close($ch);
+        @kids = split(/\s+/, $line // '');
+    }
+    kill_process_tree($_) for @kids;
+    kill(3, $pid);
 }
 
 # Read data sent by the client.  For DTLS the proxy socket is unconnected,
@@ -667,6 +744,59 @@ sub client_sysread
     return undef if !defined $peer;
     $self->{client_sockaddr} = $peer;
     return length($$dataref);
+}
+
+# Feed a line to the DTLS s_server's stdin.  It reads commands there -- "k"
+# and "K" make it call SSL_key_update() -- and the proxy keeps that stdin open
+# on a pipe for the lifetime of the run, so a test can drive it.  Only valid
+# while the server is running, i.e. from inside a filter.
+sub write_to_server_stdin
+{
+    my ($self, $data) = @_;
+
+    return 0 if !$self->{isdtls} || !defined $self->{stdin_holder};
+
+    my $old = select($self->{stdin_holder});
+    $| = 1;
+    print {$self->{stdin_holder}} $data;
+    select($old);
+
+    return 1;
+}
+
+# Queue a line on the DTLS s_client's stdin.  s_client sends each line it reads
+# there as application data, so this is how a test makes the peer write again
+# after the handshake -- which is what puts records into a rekeyed epoch.
+# Only valid while the client is running, i.e. from inside a filter.
+sub write_to_client_stdin
+{
+    my ($self, $data) = @_;
+
+    return 0 if !$self->{isdtls} || !defined $self->{client_stdin_holder};
+
+    my $old = select($self->{client_stdin_holder});
+    $| = 1;
+    print {$self->{client_stdin_holder}} $data;
+    select($old);
+
+    return 1;
+}
+
+# Hang up the client's stdin.  s_client then sends its close_notify and exits,
+# which is the only thing that ends a DTLS run cleanly: the proxy's own
+# constructed close_notify is not decryptable, so without the client's real one
+# s_server sits in SSL_read forever.  Call this from a filter once the test has
+# seen what it came for.
+sub close_client_stdin
+{
+    my ($self) = @_;
+
+    return 0 if !defined $self->{client_stdin_holder};
+
+    close($self->{client_stdin_holder});
+    $self->{client_stdin_holder} = undef;
+
+    return 1;
 }
 
 # Send data to the client, using the address it last sent from in the DTLS
@@ -1147,6 +1277,18 @@ sub sessionfile
         TLSProxy::Message->successondata(1);
     }
     return $self->{sessionfile};
+}
+# Ask for the client's stdin to stay open past the queued request data, so a
+# DTLS test can keep s_client running into the post-handshake period and drive
+# it itself.  Off by default because the EOF that closing it produces is what
+# normally ends a run.  Must be set before start().
+sub hold_client_stdin
+{
+    my $self = shift;
+    if (@_) {
+        $self->{hold_client_stdin} = shift;
+    }
+    return $self->{hold_client_stdin};
 }
 sub expected_tickets
 {
