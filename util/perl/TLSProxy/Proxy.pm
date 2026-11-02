@@ -979,8 +979,17 @@ sub process_packet
     #A DTLS 1.3 unified header with L=0 carries no length field, so the record
     #it describes runs to the end of the datagram (dtls_meth.c reads the
     #remainder as its body).  A second record behind it would be swallowed, so
-    #each unified record is emitted as a datagram of its own.  Legacy records
-    #-- epoch 0, TLS, or a no-dtls1_3_minunihdr build -- still coalesce.
+    #each unified record is emitted as a datagram of its own.  Only records
+    #without a unified header -- epoch 0 and TLS -- still coalesce.
+    #
+    #That is keyed on the record, not on the build.  The proxy never asks
+    #whether the library is a no-dtls1_3_minunihdr one: a parsed record is
+    #unified because its own first byte carries the fix bits, and one the proxy
+    #builds itself is unified whenever it is DTLS 1.3 with epoch > 0, which is
+    #the library's own rule at dtls_meth.c.  So in the oracle build the peer's
+    #keyed records still arrive with L=1 and are still forwarded one per
+    #datagram -- legal, just not minimal.  fwd_coalesced_unified below is what
+    #keeps that claim honest in either build.
     my @groups = ();
     my @current = ();
     foreach my $record (@{$self->record_list}) {
