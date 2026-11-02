@@ -105,6 +105,8 @@ sub get_records
         my $epoch;
         my $seq;
         my $isunifiedhdr;
+        my $sbit = 0;
+        my $lbit = 0;
 
         if ($isdtls == 1) {
 
@@ -113,8 +115,8 @@ sub get_records
 
             if ($isunifiedhdr == 1) {
                 my $cbit = substr($content_type, 3, 1);
-                my $sbit = substr($content_type, 4, 1);
-                my $lbit = substr($content_type, 5, 1);
+                $sbit = substr($content_type, 4, 1);
+                $lbit = substr($content_type, 5, 1);
                 my $eebits = substr($content_type, 6, 2);
 
                 if ($cbit == "1") {
@@ -210,7 +212,10 @@ sub get_records
                 $len,       # len_real
                 $len,       # decrypt_len
                 $data,      # data
-                $data       # decrypt_data
+                $data,      # decrypt_data
+                $isunifiedhdr ? 1 : 0,
+                $isunifiedhdr ? 0 + $sbit : 0,
+                $isunifiedhdr ? 0 + $lbit : 0
             );
         } else {
             $record = TLSProxy::Record->new(
@@ -230,9 +235,14 @@ sub get_records
                 && (!TLSProxy::Proxy->is_tls13()
                     || !$isdtls && $content_type != RT_ALERT
                     || $isunifiedhdr)) {
+            # A unified header is DTLSCiphertext by definition, so it is
+            # de-protected whenever it is parsed. The connection level
+            # encryption flags are set while the ServerHello is being parsed,
+            # so records that arrive early (0-RTT, or a keyed record buffered
+            # behind an epoch 0 flight) must not depend on them.
             if (($serverissender && $server_encrypting)
-                     || (!$serverissender && $client_encrypting) || TLSProxy::Proxy->is_tls13() && $isunifiedhdr) {
-                if (!TLSProxy::Proxy->is_tls13() && $etm) {
+                     || (!$serverissender && $client_encrypting) || $isunifiedhdr) {
+                if (!$isunifiedhdr && !TLSProxy::Proxy->is_tls13() && $etm) {
                     $record->decryptETM();
                 } else {
                     $record->decrypt();
@@ -293,6 +303,11 @@ sub etm
     return $etm;
 }
 
+# The last three arguments describe the wire format and are optional for
+# records a test builds itself: a DTLS 1.3 record in a keyed epoch is
+# DTLSCiphertext, which is the rule dtls_prepare_record_header() applies.
+# get_records() always passes them explicitly, because for a parsed record
+# only the header itself decides the format.
 sub new_dtls
 {
     my $class = shift;
@@ -306,8 +321,30 @@ sub new_dtls
         $len_real,
         $decrypt_len,
         $data,
-        $decrypt_data) = @_;
-    return $class->init($serverissender,
+        $decrypt_data,
+        $unified,
+        $unified_sbit,
+        $unified_lbit) = @_;
+
+    # Only records a test builds itself reach here without a header to read,
+    # so the connection's negotiated version is the only DTLS 1.3 signal
+    # available: the version field of a unified record reads as DTLS 1.2.
+    # get_records() always passes $unified explicitly, so a parsed record never
+    # depends on this.
+    $unified = defined $unified
+               ? ($unified ? 1 : 0)
+               : ($epoch > 0 && TLSProxy::Proxy->is_tls13() ? 1 : 0);
+    if (!$unified) {
+        $unified_sbit = 0;
+        $unified_lbit = 0;
+    } else {
+        # Default to the minimal header: no sequence number field beyond one
+        # byte and no length field.
+        $unified_sbit = defined $unified_sbit ? ($unified_sbit ? 1 : 0) : 0;
+        $unified_lbit = defined $unified_lbit ? ($unified_lbit ? 1 : 0) : 0;
+    }
+
+    my $self = $class->init($serverissender,
         1,
         $flight,
         $content_type,
@@ -318,7 +355,21 @@ sub new_dtls
         $len_real,
         $decrypt_len,
         $data,
-        $decrypt_data);
+        $decrypt_data,
+        $unified,
+        $unified_sbit,
+        $unified_lbit);
+
+    # A unified header carries no content type: the first byte is the header
+    # itself, and the content type travels inside the payload. Derive it the
+    # way dtls_prepare_record_header() does. For a record that came off the
+    # wire this reproduces the byte that was read, because that byte is the
+    # same function of the same three fields.
+    $self->outer_content_type(0x20 | ($unified_sbit << 3)
+                                    | ($unified_lbit << 2)
+                                    | ($epoch & 0x03)) if $unified;
+
+    return $self;
 }
 
 sub new
@@ -362,7 +413,10 @@ sub init
         $len_real,
         $decrypt_len,
         $data,
-        $decrypt_data) = @_;
+        $decrypt_data,
+        $unified,
+        $unified_sbit,
+        $unified_lbit) = @_;
 
     my $self = {
         serverissender => $serverissender,
@@ -381,6 +435,10 @@ sub init
         sent => 0,
         encrypted => 0,
         outer_content_type => $content_type,
+        aead_unwrapped => 0,
+        unified => $unified // 0,
+        unified_sbit => $unified_sbit // 0,
+        unified_lbit => $unified_lbit // 0,
     };
 
     return bless $self, $class;
@@ -420,12 +478,19 @@ sub decrypt()
     my ($self) = shift;
     my $mactaglen = 20;
     my $data = $self->data;
+    # A unified header is DTLSCiphertext, so it is always AEAD sealed. It must
+    # not fall through to the CBC branch below just because the connection has
+    # not parsed its ServerHello yet.
+    my $aead = TLSProxy::Proxy->is_tls13() || $self->{unified};
 
     #Throw away any IVs
-    if (TLSProxy::Proxy->is_tls13()) {
+    if ($aead) {
         #A TLS1.3 client, when processing the server's initial flight, could
         #respond with either an encrypted or an unencrypted alert.
-        if ($self->content_type() == RT_ALERT) {
+        #A unified record cannot be one: its content type is still the raw
+        #0x2x header byte at this point, so exclude it by hand rather than
+        #relying on that.
+        if (!$self->{unified} && $self->content_type() == RT_ALERT) {
             #TODO(TLS1.3): Eventually it is sufficient just to check the record
             #content type. If an alert is encrypted it will have a record
             #content type of application data. However we haven't done the
@@ -451,11 +516,14 @@ sub decrypt()
     #Throw away the MAC or TAG
     $data = substr($data, 0, length($data) - $mactaglen);
 
-    if (TLSProxy::Proxy->is_tls13()) {
+    if ($aead) {
         #Get the content type
         my $content_type = unpack("C", substr($data, length($data) - 1));
         $self->content_type($content_type);
         $data = substr($data, 0, length($data) - 1);
+        # The content type that travels on the wire is the one that was
+        # replaced above, so re-serialisation has to reach for it explicitly.
+        $self->{aead_unwrapped} = 1;
     }
 
     $self->decrypt_data($data);
@@ -477,40 +545,37 @@ sub reconstruct_record
     }
     $self->{sent} = 1;
 
-    my $content_type = (TLSProxy::Proxy->is_tls13() && $self->encrypted)
+    # Which header to emit is a property of the record, never of the
+    # connection: is_tls13() and encrypted() both flip mid-connection, and
+    # clearClient() resets them while records from the previous connection are
+    # still queued. The content type on the wire is whatever the record layer
+    # had before decrypt() replaced it with the inner one.
+    my $content_type = ($self->{unified} || $self->{aead_unwrapped})
                        ? $self->outer_content_type : $self->content_type;
     if($self->{isdtls}) {
         my $seqhi = ($self->seq >> 32) & 0xffff;
         my $seqmi = ($self->seq >> 16) & 0xffff;
         my $seqlo = ($self->seq >> 0) & 0xffff;
 
-        if (TLSProxy::Proxy->is_tls13() && $self->encrypted) {
+        if ($self->{unified}) {
             # Mask sequence number with record body bytes. Explanation
             # given in get_records.
             (my $maskhi, my $maskmi, my $masklo) = unpack("nnn", $self->data);
 
-            my $ct = unpack('B[8]', pack('C', $content_type));
-            my $sbit = substr($ct, 4, 1);
-            my $lbit = substr($ct, 5, 1);
-
-            if ($lbit == "1") {
-                if ($sbit == "1") {
+            if ($self->{unified_lbit}) {
+                if ($self->{unified_sbit}) {
                     $seqlo ^= $maskhi;
-                    # Prepare a unified header
                     $data = pack('Cnn', $content_type, $seqlo, $self->len);
                 } else {
                     $seqlo = ($seqlo & 0xff) ^ ($maskhi >> 8);
-                    # Prepare a unified header
                     $data = pack('CCn', $content_type, $seqlo, $self->len);
                 }
             } else {
-                if ($sbit == "1") {
+                if ($self->{unified_sbit}) {
                     $seqlo ^= $maskhi;
-                    # Prepare a unified header
                     $data = pack('Cn', $content_type, $seqlo);
                 } else {
                     $seqlo = ($seqlo & 0xff) ^ ($maskhi >> 8);
-                    # Prepare a unified header
                     $data = pack('CC', $content_type, $seqlo);
                 }
             }
@@ -565,6 +630,23 @@ sub isdtls
 {
     my $self = shift;
     return $self->{isdtls};
+}
+# How the record arrived on the wire. Read only: reconstructing it in a
+# different shape would make the proxy's output unparseable for the peer.
+sub unified
+{
+    my $self = shift;
+    return $self->{unified};
+}
+sub unified_sbit
+{
+    my $self = shift;
+    return $self->{unified_sbit};
+}
+sub unified_lbit
+{
+    my $self = shift;
+    return $self->{unified_lbit};
 }
 sub flight
 {
