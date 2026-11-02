@@ -77,6 +77,14 @@ BEGIN
 my $is_tls13 = 0;
 my $ciphersuite = undef;
 
+# Fourth of the unified-header invariants: a forwarded datagram that carries
+# more than one record and at least one unified one.  Under MINUNIHDR a record
+# has no length field, so the first unified record claims the rest of the
+# datagram and the peer never sees the others -- no error anywhere, just a
+# handshake that stops making progress.  The other three invariants live with
+# the code they watch, in Record.pm.
+my $fwd_coalesced_unified = 0;
+
 sub new {
     my $class = shift;
     my ($filter,
@@ -171,6 +179,7 @@ sub clearClient
     $self->{seen_msgseq} = {};
     $self->{dgram_count} = 0;
     $self->{partial_dropped} = 0;
+    $fwd_coalesced_unified = 0;
     $self->close_client_stdin();
     $self->{hold_client_stdin} = 0;
     $self->{clientflags} = "";
@@ -706,6 +715,19 @@ sub clientstart
     }
     $self->{clientexit} = $? unless $self->{client_killed};
 
+    # Over a DTLS run all four unified-header invariants have to read 0.  They
+    # are invariants of the proxy rather than an expectation about any one test,
+    # so a non-zero value is a proxy defect and the run is not allowed to pass
+    # on top of it.
+    if ($self->{isdtls}) {
+        my %inv = $self->unified_invariants();
+        print "NOTE: unified invariants "
+              .join(" ", map { $_."=".$inv{$_} } sort keys %inv)."\n";
+        my @bad = grep { $inv{$_} != 0 } sort keys %inv;
+        die "unified-header invariant violated: "
+            .join(", ", map { $_."=".$inv{$_} } @bad)."\n" if @bad;
+    }
+
     return $success;
 }
 
@@ -1003,6 +1025,20 @@ sub process_packet
             $item->[0]->{dgram} = $self->{dgram_count};
             $datagram .= $item->[1];
         }
+
+        # The grouping above gives every unified record a datagram of its own,
+        # so this should be unreachable.  Counting it rather than trusting the
+        # comment is the point: a datagram that leaves with two unified records
+        # in it is silently truncated at the peer, which has no length field to
+        # find the second one with.
+        my $uni_in_group = grep { $_->[0]->unified() } @{$group};
+        if (@{$group} > 1 && $uni_in_group > 0) {
+            $fwd_coalesced_unified++;
+            print "COALESCED dir=".$serverissender
+                  ." fl=".$group->[0][0]->flight()
+                  ." n=".scalar(@{$group})." unified=".$uni_in_group."\n";
+        }
+
         print "Forwarded packet length = ".length($datagram)."\n\n";
         push @out, $datagram;
         $self->{dgram_count}++;
@@ -1110,6 +1146,17 @@ sub partial_dropped
 {
     my $self = shift;
     return $self->{partial_dropped};
+}
+# The four unified-header invariants.  They live with the code each one
+# watches, so gather them for a recipe that wants to assert over a whole run.
+sub unified_invariants
+{
+    return (
+        fwd_coalesced_unified    => $fwd_coalesced_unified,
+        recon_legacy_but_unified => TLSProxy::Record->recon_legacy_but_unified(),
+        unified_undecrypted      => TLSProxy::Record->unified_undecrypted(),
+        ct_undef_lookup          => TLSProxy::Record->ct_undef_lookup(),
+    );
 }
 sub success
 {

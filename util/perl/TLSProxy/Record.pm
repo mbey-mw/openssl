@@ -31,6 +31,20 @@ my %uni_shape;
 my $cid_dropped = 0;
 my $short_dropped = 0;
 
+# The unified-header invariants.  Each one stands over a defect that used to be
+# invisible because the proxy simply produced the wrong bytes: a unified record
+# re-serialised with a DTLSPlaintext header, which the peer discards outside
+# epoch 0; a unified record forwarded as raw ciphertext, which the message
+# layer then reads as a handshake header; and a content type that %record_type
+# has no label for, so the debug output prints nothing after "Content type: "
+# and the reader concludes there was nothing to see.
+# A fourth, fwd_coalesced_unified, sits with the forwarder in Proxy.pm.
+# They must read 0 over a clean run; a non-zero value is a proxy defect, not a
+# test failure to be worked around.
+my $recon_legacy_but_unified = 0;
+my $unified_undecrypted = 0;
+my $ct_undef_lookup = 0;
+
 use constant DTLS_RECORD_HEADER_LENGTH => 13;
 use constant TLS_RECORD_HEADER_LENGTH => 5;
 
@@ -226,6 +240,7 @@ sub get_records
         my $isunifiedhdr;
         my $sbit = 0;
         my $lbit = 0;
+        my $decrypted = 0;
 
         if ($isdtls == 1) {
 
@@ -344,7 +359,8 @@ sub get_records
 
         my $data = substr($packet, $record_hdr_len, $len);
 
-        print "  Content type: ".$record_type{$content_type}."\n";
+        print "  Content type: "
+              .TLSProxy::Record->record_type_name($content_type)."\n";
         print "  Version: $tls_version{$version}\n";
         if($isdtls == 1) {
             print "  Epoch: $epoch\n";
@@ -401,13 +417,26 @@ sub get_records
                     $record->decrypt();
                 }
                 $record->encrypted(1);
+                $decrypted = 1;
 
                 if (TLSProxy::Proxy->is_tls13()) {
                     print "  Inner content type: "
-                          .$record_type{$record->content_type()}."\n";
+                          .TLSProxy::Record->record_type_name($record->content_type())."\n";
                     print " Data: ".unpack("n",$record->decrypt_data)."\n";
                 }
             }
+        }
+
+        # The two gates above are written so that a unified record always takes
+        # the de-protect path.  If a connection-state condition ever creeps back
+        # into them, the raw ciphertext is forwarded as-is and get_messages()
+        # reads it as a handshake header -- which is what happened to records
+        # seen before the ServerHello.  Count it rather than let it pass
+        # quietly.
+        if ($isunifiedhdr && !$decrypted) {
+            $unified_undecrypted++;
+            print "  Unified record was not de-protected: ep=$epoch seq=$seq"
+                  ." len=$len fl=$flight dir=".$serverissender."\n";
         }
 
         push @record_list, $record;
@@ -432,6 +461,9 @@ sub clear
     %uni_shape = ();
     $cid_dropped = 0;
     $short_dropped = 0;
+    $recon_legacy_but_unified = 0;
+    $unified_undecrypted = 0;
+    $ct_undef_lookup = 0;
 }
 
 # Read-only counters for the two ways a unified record is discarded rather than
@@ -443,6 +475,38 @@ sub cid_dropped
 sub short_dropped
 {
     return $short_dropped;
+}
+
+# Read-only views of the unified-header invariants.  The forwarder owns the
+# coalescing one, so the four are gathered for a recipe by
+# TLSProxy::Proxy->unified_invariants().
+sub recon_legacy_but_unified
+{
+    return $recon_legacy_but_unified;
+}
+sub unified_undecrypted
+{
+    return $unified_undecrypted;
+}
+sub ct_undef_lookup
+{
+    return $ct_undef_lookup;
+}
+
+# Label a content type for the record dump, counting the lookups that have no
+# label at all.  An unknown first byte used to print "Content type: " with
+# nothing after it, which reads as an empty field rather than as a content type
+# the proxy does not know.
+sub record_type_name
+{
+    my ($class, $content_type) = @_;
+    my $name = $record_type{$content_type};
+
+    if (!defined $name) {
+        $ct_undef_lookup++;
+        return sprintf("<no label for content type 0x%02x>", $content_type);
+    }
+    return $name;
 }
 
 # The (S, L) bit pair of the unified headers seen from $serverissender, defaulting
@@ -750,6 +814,23 @@ sub reconstruct_record
     }
 
     $data .= $self->data;
+
+    # A record parsed from a unified header has to leave with a unified header.
+    # While the format came from is_tls13() and encrypted() it could come back
+    # through the DTLSPlaintext branch instead -- 13 bytes of classic header on
+    # a record the peer only accepts in epoch 0 -- so the record silently never
+    # arrived.  The header length is the discriminator, not the first byte:
+    # the legacy branch packs outer_content_type as its first byte too, and a
+    # recipe may deliberately corrupt that byte to test what the peer makes of a
+    # malformed record, which must not read as the proxy losing the format.
+    if ($self->{unified}
+            && length($data) - length($self->data) >= DTLS_RECORD_HEADER_LENGTH) {
+        $recon_legacy_but_unified++;
+        print "  Unified record re-serialised with a legacy header: ep="
+              .$self->epoch()." seq=".$self->seq()." len=".$self->len()
+              ." enc=".$self->encrypted()
+              ." hdr=".(length($data) - length($self->data))."\n";
+    }
 
     return $data;
 }
