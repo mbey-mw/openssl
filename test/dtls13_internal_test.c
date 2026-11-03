@@ -21,6 +21,19 @@
 static char *cert = NULL;
 static char *privkey = NULL;
 
+/*
+ * bio_s_maybe_retry charges one credit per transport operation. A minimal
+ * unified header carries no length field, so each record also needs a flush of
+ * its own to put the datagram boundary where the record boundary is. Letting
+ * one record out and failing the write of the next therefore costs one credit
+ * without the header and two with it.
+ */
+#ifdef OPENSSL_NO_DTLS1_3_MINUNIHDR
+# define RETRY_CREDITS_PER_RECORD 1
+#else
+# define RETRY_CREDITS_PER_RECORD 2
+#endif
+
 static const char *cipher_names[] = {
     "aes-128-ecb",
     "aes-256-ecb",
@@ -725,15 +738,6 @@ static int test_dtls13_ack_records(int idx)
     size_t limit;
     int ret, testresult = 0;
 
-#ifndef OPENSSL_NO_DTLS1_3_MINUNIHDR
-    if (idx == 2)
-        return TEST_skip("cc->init_off is 0 rather than > 0 at"
-                         " test/dtls13_internal_test.c:770: the flush that ends"
-                         " a unified-header record's datagram costs the retry BIO"
-                         " a credit of its own, so the first ACK fragment fails"
-                         " where the second was meant to");
-#endif
-
     if (!TEST_true(create_ssl_ctx_pair(NULL, DTLS_server_method(),
             DTLS_client_method(), DTLS1_3_VERSION, DTLS1_3_VERSION,
             &sctx, &cctx, cert, privkey))
@@ -771,7 +775,8 @@ static int test_dtls13_ack_records(int idx)
         SSL_set0_wbio(client, BIO_push(retry, SSL_get_wbio(client)));
         retry = NULL;
         if (!TEST_long_eq(BIO_ctrl(SSL_get_wbio(client),
-                              MAYBE_RETRY_CTRL_SET_RETRY_AFTER_CNT, 1, NULL),
+                              MAYBE_RETRY_CTRL_SET_RETRY_AFTER_CNT,
+                              RETRY_CREDITS_PER_RECORD, NULL),
                 1))
             goto end;
         ret = SSL_read(client, &buf, 1);
@@ -1352,14 +1357,15 @@ static int interrupted_ticket_retransmit_setup(SSL_CTX **sctx_out, SSL_CTX **cct
     if (!TEST_long_gt(SSL_set_mtu(server, 257), 0))
         goto end;
 
-    /* Fail the write following the next successful one. */
+    /* Let one record out and fail on the next one's write. */
     if (!TEST_ptr(retry = BIO_new(bio_s_maybe_retry()))
         || !TEST_true(BIO_up_ref(SSL_get_wbio(server))))
         goto end;
     SSL_set0_wbio(server, BIO_push(retry, SSL_get_wbio(server)));
     retry = NULL;
     if (!TEST_long_eq(BIO_ctrl(SSL_get_wbio(server),
-                          MAYBE_RETRY_CTRL_SET_RETRY_AFTER_CNT, 1, NULL),
+                          MAYBE_RETRY_CTRL_SET_RETRY_AFTER_CNT,
+                          RETRY_CREDITS_PER_RECORD, NULL),
             1))
         goto end;
 
@@ -1416,15 +1422,6 @@ static int test_dtls13_interrupted_retransmit_range(void)
     size_t body_len;
     int testresult = 0;
 
-#ifndef OPENSSL_NO_DTLS1_3_MINUNIHDR
-    return TEST_skip("interrupted_ticket_retransmit_setup() cannot abort the"
-                     " retransmission mid-message: sc->init_off is 0 rather than"
-                     " > 0 at test/dtls13_internal_test.c:1382, because the flush"
-                     " that ends a unified-header record's datagram costs the"
-                     " retry BIO a credit of its own and the first fragment fails"
-                     " where the second was meant to");
-#endif
-
     if (!interrupted_ticket_retransmit_setup(&sctx, &cctx, &server, &client,
             &sc, &msg))
         goto end;
@@ -1467,15 +1464,6 @@ static int test_dtls13_ack_bitmap_oob(void)
     WPACKET pkt;
     size_t acklen, written, worst = 0;
     int ret, testresult = 0;
-
-#ifndef OPENSSL_NO_DTLS1_3_MINUNIHDR
-    return TEST_skip("interrupted_ticket_retransmit_setup() cannot abort the"
-                     " retransmission mid-message: sc->init_off is 0 rather than"
-                     " > 0 at test/dtls13_internal_test.c:1382, because the flush"
-                     " that ends a unified-header record's datagram costs the"
-                     " retry BIO a credit of its own and the first fragment fails"
-                     " where the second was meant to");
-#endif
 
     if (!interrupted_ticket_retransmit_setup(&sctx, &cctx, &server, &client,
             &sc, &msg))
