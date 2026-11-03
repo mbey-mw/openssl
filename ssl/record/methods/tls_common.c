@@ -1905,6 +1905,23 @@ err:
 int tls_write_records(OSSL_RECORD_LAYER *rl, OSSL_RECORD_TEMPLATE *templates,
     size_t numtempl)
 {
+#ifndef OPENSSL_NO_DTLS1_3_MINUNIHDR
+    /*
+     * A drain that failed before its record reached the buffering BIO left it
+     * queued here; every other DTLS failure path drops the record instead. It
+     * must go out before a new one is built, so complete it now and report the
+     * retry rather than violating the invariant checked below.
+     */
+    if (rl->isdtls
+            && rl->nextwbuf < rl->numwpipes
+            && TLS_BUFFER_get_left(&rl->wbuf[rl->nextwbuf]) != 0) {
+        int ret = tls_retry_write_records(rl);
+
+        if (ret != OSSL_RECORD_RETURN_SUCCESS)
+            return ret;
+    }
+#endif
+
     /* Check we don't have pending data waiting to write */
     if (!ossl_assert(rl->nextwbuf >= rl->numwpipes
             || TLS_BUFFER_get_left(&rl->wbuf[rl->nextwbuf]) == 0)) {

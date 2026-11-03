@@ -448,16 +448,6 @@ static int test_dtls13_ticket_ack_retransmit(int idx)
     int fragmented = (idx / 2) % 2;
     int retry_write = idx % 2;
 
-#ifndef OPENSSL_NO_DTLS1_3_MINUNIHDR
-    if (retry_write)
-        return TEST_skip("SSL_read() reports SSL_ERROR_SSL rather than the"
-                         " expected SSL_ERROR_WANT_READ at"
-                         " test/dtls13_internal_test.c:540: the drain that ends"
-                         " a unified-header record's datagram can leave that"
-                         " record queued, and the next tls_write_records()"
-                         " then fails its own pending-data check");
-#endif
-
     ticket_count = 0;
     if (!TEST_true(create_ssl_ctx_pair(NULL, DTLS_server_method(),
             DTLS_client_method(), DTLS1_3_VERSION, DTLS1_3_VERSION,
