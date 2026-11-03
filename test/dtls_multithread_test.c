@@ -488,16 +488,19 @@ static int test_dtls_listener_clear_replace_race(void)
     int i;
 
     /*
-     * Fails in roughly half of all runs -- 7 of 12 here, and 6 of 12 with the
-     * minimal unified header compiled out, so deliberately not guarded on
-     * OPENSSL_NO_DTLS1_3_MINUNIHDR: the other build fails it too. The
-     * re-handshake after SSL_clear() ends with the server in
-     * dtls1_read_bytes:unexpected record and the client receiving an
-     * unexpected_message alert. The other four cases in this binary pass every
-     * run, so keep them running and report this one as skipped.
+     * Fails in roughly half of all runs, at the same rate with the minimal
+     * unified headers compiled in and compiled out, so this is not a
+     * minimal-header problem.  Bisected to 1a2c082d15 ("repair length
+     * calculation in dtls_get_more_records for unified headers without length
+     * field"), which turned a silent discard into an accepted record: the
+     * epoch 3 datagrams a connection leaves in DTLS_RX::urxe_pending survive
+     * SSL_clear(), and once the record layer is back at DTLS_ANY_VERSION a
+     * misaligned read inside one of them can look like a unified header with
+     * the length bit clear.  That queue is just as full in runs that pass, so
+     * what decides a run is still open; keep the case reported rather than
+     * blocking the build until it is.
      */
-    return TEST_skip("flaky: the clear/replace re-handshake loses a record about"
-                     " half of all runs, in both builds");
+    return TEST_skip("flaky: stale listener datagrams survive SSL_clear()");
 
     memset(thread_args, 0, sizeof(thread_args));
     memset(&traffic_args, 0, sizeof(traffic_args));
