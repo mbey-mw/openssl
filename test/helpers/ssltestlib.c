@@ -589,107 +589,156 @@ int mempacket_swap_epoch(BIO *bio)
 }
 
 /*
- * Look for records from different epochs in the last datagram and swap them
- * around
+ * Parse the DTLS record header at |rec|, which has |rem| bytes left in its
+ * datagram, into the epoch it carries and the record's total length. Returns
+ * 0 if the header is truncated or claims more data than is present.
  */
-int mempacket_swap_epoch_dtls13(BIO *bio)
+static int dtls_test_record_header(const unsigned char *rec, int rem,
+                                   unsigned int *epoch, int *len)
+{
+    int rechdrlen;
+
+    if (DTLS13_UNI_HDR_FIX_BITS_IS_SET(*rec))
+        rechdrlen = 1 + (DTLS13_UNI_HDR_SEQ_BIT_IS_SET(*rec) ? 2 : 1) +
+            (DTLS13_UNI_HDR_LEN_BIT_IS_SET(*rec) ? 2 : 0);
+    else
+        rechdrlen = DTLS1_RT_HEADER_LENGTH;
+
+    if (rem < rechdrlen)
+        return 0;
+
+    if (DTLS13_UNI_HDR_FIX_BITS_IS_SET(*rec)) {
+        *epoch = *rec & DTLS13_UNI_HDR_EPOCH_BITS_MASK;
+
+        if (*epoch == 0)
+            *epoch = 4;
+
+        if (DTLS13_UNI_HDR_LEN_BIT_IS_SET(*rec)) {
+            int len_off = DTLS13_UNI_HDR_SEQ_BIT_IS_SET(*rec) ? 0 : 1;
+
+            *len = ((rec[DTLS13_UNI_HDR_RECORD_LEN_HI - len_off] << 8)
+                | rec[DTLS13_UNI_HDR_RECORD_LEN_LO - len_off]);
+        } else {
+            *len = rem - rechdrlen;
+        }
+    } else {
+        *epoch = (rec[RECORD_EPOCH_HI] << 8) | rec[RECORD_EPOCH_LO];
+        *len = (rec[RECORD_LEN_HI] << 8) | rec[RECORD_LEN_LO];
+    }
+    *len += rechdrlen;
+
+    return rem >= *len;
+}
+
+/*
+ * Find the first record whose epoch differs from the epoch the peer has read
+ * up to, and move it one step earlier so the peer sees a record from the next
+ * epoch before the previous epoch's flight has been delivered.
+ *
+ * The whole server flight used to be coalesced into a single datagram, so the
+ * epoch change always fell *inside* one MEMPACKET -- hence the hard-coded
+ * packet index this replaced. With minimal unified headers every record gets a
+ * datagram of its own, so the two records straddle a packet boundary instead.
+ *
+ * On success, if |early_pkt| is not NULL it receives the index of the packet
+ * the next-epoch record now sits in. Callers that need to know a reorder
+ * really happened -- rather than just that this returned true -- assert on it.
+ */
+int mempacket_swap_epoch_dtls13(BIO *bio, int *early_pkt)
 {
     MEMPACKET_TEST_CTX *ctx = BIO_get_data(bio);
-    MEMPACKET *thispkt;
-    int rem, len, prevlen = 0;
+    MEMPACKET *thispkt, *prevpkt = NULL, *newpkt;
     unsigned char *rec, *prevrec = NULL, *tmp;
     unsigned int epoch;
     int numpkts = sk_MEMPACKET_num(ctx->pkts);
+    int i, rem, len, prevlen = 0, prevrem = 0, prevpktidx = -1;
+
+    if (early_pkt != NULL)
+        *early_pkt = -1;
 
     if (numpkts <= 0)
         return 0;
 
-    /*
-     * We need to look at the packet that contains the last Epoch 0 and the
-     * first Epoch 1 record. This is in Packet 5.
-     */
-    thispkt = sk_MEMPACKET_value(ctx->pkts, 5);
-    if (thispkt == NULL)
-        return 0;
-
-    for (rem = thispkt->len, rec = thispkt->data;
-        rem > 0; rem -= len, rec += len) {
-        int rechdrlen;
-
-        if (DTLS13_UNI_HDR_FIX_BITS_IS_SET(*rec))
-            rechdrlen = 1 + (DTLS13_UNI_HDR_SEQ_BIT_IS_SET(*rec) ? 2 : 1) +
-                (DTLS13_UNI_HDR_LEN_BIT_IS_SET(*rec) ? 2 : 0);
-        else
-            rechdrlen = DTLS1_RT_HEADER_LENGTH;
-
-        if (rem < rechdrlen)
-            return 0;
-        if (DTLS13_UNI_HDR_FIX_BITS_IS_SET(*rec)) {
-            epoch = *rec & DTLS13_UNI_HDR_EPOCH_BITS_MASK;
-
-            if (epoch == 0)
-                epoch = 4;
-
-            if (DTLS13_UNI_HDR_LEN_BIT_IS_SET(*rec)) {
-                int len_off = DTLS13_UNI_HDR_SEQ_BIT_IS_SET(*rec) ? 0 : 1;
-                len = ((rec[DTLS13_UNI_HDR_RECORD_LEN_HI - len_off] << 8)
-                    | rec[DTLS13_UNI_HDR_RECORD_LEN_LO - len_off]);
-            } else {
-                len = rem - rechdrlen;
-            }
-            len += rechdrlen;
-        } else {
-            epoch = (rec[RECORD_EPOCH_HI] << 8) | rec[RECORD_EPOCH_LO];
-            len = ((rec[RECORD_LEN_HI] << 8) | rec[RECORD_LEN_LO]) + rechdrlen;
-        }
-        if (rem < len)
+    for (i = 0; i < numpkts; i++) {
+        thispkt = sk_MEMPACKET_value(ctx->pkts, i);
+        if (thispkt == NULL)
             return 0;
 
-        /* Assumes the epoch change does not happen on the first record */
-        if (epoch != ctx->epoch) {
-            if (prevrec == NULL)
+        for (rem = thispkt->len, rec = thispkt->data;
+            rem > 0; rem -= len, rec += len) {
+            if (!dtls_test_record_header(rec, rem, &epoch, &len))
                 return 0;
 
-            /*
-             * We found 2 records with different epochs. Take a copy of the
-             * earlier record
-             */
-            tmp = OPENSSL_malloc(prevlen);
-            if (tmp == NULL)
-                return 0;
-
-            memcpy(tmp, prevrec, prevlen);
-            /*
-             * Move everything from this record onwards, including any trailing
-             * records, and overwrite the earlier record
-             */
-            memmove(prevrec, rec, rem);
-            thispkt->len -= prevlen;
-
-            /*
-             * Create a new packet for the earlier record that we took out and
-             * add it to the end of the packet list.
-             */
-            thispkt = OPENSSL_malloc(sizeof(*thispkt));
-            if (thispkt == NULL) {
-                OPENSSL_free(tmp);
-                return 0;
+            if (epoch == ctx->epoch) {
+                prevpkt = thispkt;
+                prevpktidx = i;
+                prevrec = rec;
+                prevlen = len;
+                prevrem = rem;
+                continue;
             }
-            thispkt->type = INJECT_PACKET;
-            thispkt->data = tmp;
-            thispkt->len = prevlen;
-            thispkt->num = numpkts;
-            if (sk_MEMPACKET_insert(ctx->pkts, thispkt, numpkts) <= 0) {
-                OPENSSL_free(tmp);
-                OPENSSL_free(thispkt);
+
+            /* Assumes the epoch change does not happen on the first record */
+            if (prevpkt == NULL)
                 return 0;
+
+            if (prevpkt == thispkt) {
+                /*
+                 * We found 2 records with different epochs in one datagram.
+                 * Take a copy of the earlier record
+                 */
+                tmp = OPENSSL_malloc(prevlen);
+                if (tmp == NULL)
+                    return 0;
+
+                memcpy(tmp, prevrec, prevlen);
+                /*
+                 * Move everything from this record onwards, including any
+                 * trailing records, and overwrite the earlier record
+                 */
+                memmove(prevrec, rec, rem);
+                thispkt->len -= prevlen;
+
+                /*
+                 * Create a new packet for the earlier record that we took out
+                 * and add it to the end of the packet list.
+                 */
+                newpkt = OPENSSL_malloc(sizeof(*newpkt));
+                if (newpkt == NULL) {
+                    OPENSSL_free(tmp);
+                    return 0;
+                }
+                newpkt->type = INJECT_PACKET;
+                newpkt->data = tmp;
+                newpkt->len = prevlen;
+                newpkt->num = numpkts;
+                if (sk_MEMPACKET_insert(ctx->pkts, newpkt, numpkts) <= 0) {
+                    OPENSSL_free(tmp);
+                    OPENSSL_free(newpkt);
+                    return 0;
+                }
+                /* We added a packet so increment lastpkt */
+                ctx->lastpkt++;
+                if (early_pkt != NULL)
+                    *early_pkt = i;
+                return 1;
             }
-            /* We added a packet so increment lastpkt */
-            ctx->lastpkt++;
+
+            /*
+             * One record per datagram, so the epoch change falls between two
+             * adjacent packets. Only that shape is reorderable here: the whole
+             * earlier record has to move, and it can only move as a packet.
+             */
+            if (i != prevpktidx + 1 || prevrem != prevlen
+                || rec != thispkt->data)
+                return 0;
+
+            if (!mempacket_move_packet(bio, prevpktidx, i))
+                return 0;
+            if (early_pkt != NULL)
+                *early_pkt = prevpktidx;
             return 1;
         }
-        prevrec = rec;
-        prevlen = len;
     }
 
     return 0;

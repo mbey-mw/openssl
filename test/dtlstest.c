@@ -881,17 +881,6 @@ static int test_swap_records_dtls13(int idx)
     char buf[10];
     int ret;
 
-#ifndef OPENSSL_NO_DTLS1_3_MINUNIHDR
-    if (idx == 0)
-        return TEST_skip("mempacket_swap_epoch_dtls13() returns false at"
-                         " test/dtlstest.c:915: it looks for the epoch change"
-                         " inside a single MEMPACKET, but a unified header"
-                         " carries no length field so every record gets a"
-                         " datagram of its own and the boundary between the"
-                         " ServerHello and the first epoch 2 record falls"
-                         " between two packets. Iterations 2 to 4 pass.");
-#endif
-
     if (!TEST_true(create_ssl_ctx_pair(NULL, DTLS_server_method(),
             DTLS_client_method(),
             DTLS1_3_VERSION, DTLS1_3_VERSION,
@@ -921,9 +910,16 @@ static int test_swap_records_dtls13(int idx)
 
     if (idx == 0) {
         /* Swap Server Hello and first Epoch 2 (Encrypted Extensions) */
+        int early_pkt = -1;
+
         bio = SSL_get_wbio(sssl);
         if (!TEST_ptr(bio)
-            || !TEST_true(mempacket_swap_epoch_dtls13(bio)))
+            || !TEST_true(mempacket_swap_epoch_dtls13(bio, &early_pkt))
+            /*
+             * Without this the test passes even if nothing was reordered, so
+             * it would only be checking that the helper says it succeeded.
+             */
+            || !TEST_int_ge(early_pkt, 1))
             goto end;
     }
 
@@ -2601,8 +2597,12 @@ end:
     SSL_CTX_free(sctx);
     return testresult;
 }
+#ifndef OPENSSL_NO_DTLS1_3_MINUNIHDR
 /*
- * State of the datagram filter below.
+ * State of the datagram filter below. Everything from here to
+ * test_dtls13_flush_retry() is specific to the minimal unified header: it
+ * asserts one record per datagram, which is precisely what a build with the
+ * header compiled out is allowed to break.
  */
 typedef struct {
     int reject_next;    /* an encrypted datagram is still to be rejected */
@@ -2821,6 +2821,7 @@ end:
 
     return testresult;
 }
+#endif /* OPENSSL_NO_DTLS1_3_MINUNIHDR */
 #endif /* OPENSSL_NO_DTLS1_3 */
 
 OPT_TEST_DECLARE_USAGE("certfile privkeyfile\n")
@@ -2871,7 +2872,9 @@ int setup_tests(void)
     ADD_ALL_TESTS(test_dtls13_plaintext_after_hellos, 3);
     ADD_TEST(test_dtls13_ccm8_not_offered);
     ADD_TEST(test_dtls13_ack_read_timeout);
+#ifndef OPENSSL_NO_DTLS1_3_MINUNIHDR
     ADD_TEST(test_dtls13_flush_retry);
+#endif
 #endif
 #ifndef OPENSSL_NO_DTLS1_2
     ADD_TEST(test_dtls_client_retransmit);
